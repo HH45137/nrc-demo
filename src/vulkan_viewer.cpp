@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <limits>
@@ -584,9 +585,9 @@ void VulkanViewer::Impl::createRtPipeline()
     rtPipelineLayout = device.createPipelineLayout(vk::PipelineLayoutCreateInfo({}, *rtSetLayout, cameraRange));
 
     const std::array<std::string, 3> shaderPaths = {
-        std::string(RT_SHADER_DIR) + "/raygen.spv",
-        std::string(RT_SHADER_DIR) + "/miss.spv",
-        std::string(RT_SHADER_DIR) + "/hit.spv",
+        CURRENT_RUN_PATH + "/" + SHADER_DIR + "/rt_raygen.spv",
+        CURRENT_RUN_PATH + "/" + SHADER_DIR + "/rt_miss.spv",
+        CURRENT_RUN_PATH + "/" + SHADER_DIR + "/rt_hit.spv",
     };
     std::array<vk::raii::ShaderModule, 3> shaderModules = {
         vk::raii::ShaderModule(nullptr), vk::raii::ShaderModule(nullptr), vk::raii::ShaderModule(nullptr)};

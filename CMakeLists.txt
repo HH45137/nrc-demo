@@ -49,7 +49,7 @@ endif ()
 
 find_program(GLSLANG_VALIDATOR glslangValidator REQUIRED)
 # Stage is explicit because the .glsl suffix does not imply an RT shader stage.
-set(RT_SHADERS raygen:rgen miss:rmiss hit:rchit)
+set(RT_SHADERS rt_raygen:rgen rt_miss:rmiss rt_hit:rchit)
 set(RT_SPIRV_FILES)
 foreach (PAIR IN LISTS RT_SHADERS)
     string(REPLACE ":" ";" PAIR_FIELDS "${PAIR}")
