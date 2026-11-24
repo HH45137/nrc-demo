@@ -74,6 +74,8 @@ int main(int argc, char** argv)
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGui::StyleColorsDark();
+    ImGui::GetIO().IniFilename = nullptr;
+    ImGui::GetIO().LogFilename = nullptr;
     ImGui_ImplGlfw_InitForVulkan(window, true);
 
     int result = EXIT_SUCCESS;
