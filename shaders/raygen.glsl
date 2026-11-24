@@ -21,6 +21,7 @@ struct HitPayload
 
 layout(set = 0, binding = 0) uniform accelerationStructureEXT topLevelAS;
 layout(set = 0, binding = 1, rgba8) uniform image2D outputImage;
+layout(set = 0, binding = 6, rgba32f) uniform image2D samplesAccumulated;
 
 layout(push_constant) uniform Camera
 {
@@ -28,11 +29,14 @@ layout(push_constant) uniform Camera
     vec4 right;
     vec4 up;
     vec4 forward;
+    uint sampleIndex;
+    int _pad0;
+    int _pad1;
+    int _pad2;
 } camera;
 
 layout(location = 0) rayPayloadEXT HitPayload payload;
 
-const int kSamplesPerPixel = 4; // Monte Carlo samples per pixel
 const int kMaxBounces = 4;      // maximum path length
 const float kPi = 3.14159265359;
 const float kRayTMin = 0.001;
@@ -110,7 +114,7 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed)
         {
             const float survival = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.05, 0.95);
             if (randomFloat(seed) > survival)
-                break;
+            break;
             throughput /= survival;
         }
 
@@ -127,22 +131,32 @@ void main()
     const vec2 resolution = vec2(gl_LaunchSizeEXT.xy);
     const uint pixelIndex = gl_LaunchIDEXT.y * uint(gl_LaunchSizeEXT.x) + gl_LaunchIDEXT.x;
     uint seed = pcgHash(pixelIndex ^ pcgHash(0x9e3779b9u));
+    seed = pcgHash(seed ^ camera.sampleIndex);
 
-    vec3 accumulated = vec3(0.0);
-    for (int sampleIndex = 0; sampleIndex < kSamplesPerPixel; ++sampleIndex)
+    // One sample
+    vec3 S = vec3(0.0);
     {
         // Jitter within the pixel for anti-aliasing.
         const vec2 pixel = (vec2(gl_LaunchIDEXT.xy) + vec2(randomFloat(seed), randomFloat(seed))) / resolution;
         const vec2 screen = vec2(pixel.x * 2.0 - 1.0, 1.0 - pixel.y * 2.0);
         const float aspect = resolution.x / resolution.y;
-        const vec3 direction =
-            normalize(camera.forward.xyz + screen.x * aspect * camera.right.xyz + screen.y * camera.up.xyz);
+        const vec3 direction = normalize(camera.forward.xyz + screen.x * aspect * camera.right.xyz + screen.y * camera.up.xyz);
 
-        accumulated += tracePath(camera.origin.xyz, direction, seed);
+        S = tracePath(camera.origin.xyz, direction, seed);
     }
 
-    // Average samples, apply a simple Reinhard tonemap and gamma encode.
-    vec3 color = accumulated / float(kSamplesPerPixel);
+    // Skip the frame 1
+    vec3 accumulated = imageLoad(samplesAccumulated, ivec2(gl_LaunchIDEXT.xy)).rgb;
+    if (camera.sampleIndex == 1) {
+        accumulated = vec3(0.0);
+    }
+
+    // Average samples
+    const float n = float(camera.sampleIndex);
+    vec3 color = mix(accumulated, S, 1.0 / n);
+    imageStore(samplesAccumulated, ivec2(gl_LaunchIDEXT.xy), vec4(color, 1.0));
+
+    // Apply a simple Reinhard tonemap and gamma encode.
     color = color / (vec3(1.0) + color);
     color = pow(color, vec3(1.0 / 2.2));
     imageStore(outputImage, ivec2(gl_LaunchIDEXT.xy), vec4(color, 1.0));

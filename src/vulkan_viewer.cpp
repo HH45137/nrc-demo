@@ -36,9 +36,13 @@ namespace
         alignas(16) float right[4];
         alignas(16) float up[4];
         alignas(16) float forward[4];
+        alignas(4) int sampleIndex;
+        alignas(4) int _pad0;
+        alignas(4) int _pad1;
+        alignas(4) int _pad2;
     };
 
-    CameraData makeCamera(float yaw, float pitch, float distance)
+    CameraData makeCamera(float yaw, float pitch, float distance, unsigned int sampleIndex)
     {
         const float cp = std::cos(pitch);
         const float sp = std::sin(pitch);
@@ -62,6 +66,9 @@ namespace
         camera.up[0] = camera.right[1] * camera.forward[2] - camera.right[2] * camera.forward[1];
         camera.up[1] = camera.right[2] * camera.forward[0] - camera.right[0] * camera.forward[2];
         camera.up[2] = camera.right[0] * camera.forward[1] - camera.right[1] * camera.forward[0];
+
+        camera.sampleIndex = sampleIndex;
+
         return camera;
     }
 
@@ -105,7 +112,7 @@ struct VulkanViewer::Impl
     {
         Buffer vertices, texcoords, indices, instance, blasStorage, tlasStorage, sbt;
         vk::raii::AccelerationStructureKHR blas{nullptr}, tlas{nullptr};
-        Image baseColor;
+        Image baseColor, samplesAccumulated;
         vk::raii::Sampler sampler{nullptr};
         vk::raii::DescriptorPool descriptorPool{nullptr};
         vk::raii::DescriptorSet descriptorSet{nullptr};
@@ -134,6 +141,7 @@ struct VulkanViewer::Impl
     std::vector<vk::raii::CommandBuffer> commandBuffers;
     std::array<FrameSync, kFramesInFlight> frames;
     uint32_t frameIndex{};
+    uint32_t sampleIndex{};
 
     vk::raii::SwapchainKHR swapchain{nullptr};
     std::vector<vk::Image> swapchainImages;
@@ -149,8 +157,9 @@ struct VulkanViewer::Impl
     vk::raii::Pipeline rtPipeline{nullptr};
     vk::raii::DescriptorPool rtDescriptorPool{nullptr};
     vk::raii::DescriptorPool imguiDescriptorPool{nullptr};
-    Image output;
+    Image output, samplesAccumulated;
     vk::raii::Sampler outputSampler{nullptr};
+    vk::raii::Sampler samplesAccumulatedSampler{nullptr};
     VkDescriptorSet imguiOutputSet{};
     bool outputInitialized{};
     uint32_t minImageCount{2};
@@ -164,7 +173,7 @@ struct VulkanViewer::Impl
     {
         createInstanceAndDevice();
         createCommandPool();
-        createOutputImage();
+        createAllImages();
         createRtPipeline();
         createSwapchain();
         createImGuiVulkanBackend();
@@ -251,7 +260,7 @@ struct VulkanViewer::Impl
 
     void createInstanceAndDevice();
     void createCommandPool();
-    void createOutputImage();
+    void createAllImages();
     void createRtPipeline();
     void createSwapchain();
     void createImGuiVulkanBackend();
@@ -357,8 +366,9 @@ void VulkanViewer::Impl::createCommandPool()
         vk::CommandBufferAllocateInfo(*commandPool, vk::CommandBufferLevel::ePrimary, kFramesInFlight));
 }
 
-void VulkanViewer::Impl::createOutputImage()
+void VulkanViewer::Impl::createAllImages()
 {
+    // Output
     output = createImage(kRenderWidth, kRenderHeight, vk::Format::eR8G8B8A8Unorm,
                          vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled);
     vk::SamplerCreateInfo samplerInfo;
@@ -369,11 +379,16 @@ void VulkanViewer::Impl::createOutputImage()
         vk::SamplerAddressMode::eClampToEdge;
     samplerInfo.maxLod = 0.0f;
     outputSampler = device.createSampler(samplerInfo);
+
+    // Samples accumulated
+    samplesAccumulated = createImage(kRenderWidth, kRenderHeight, vk::Format::eR32G32B32A32Sfloat,
+                                     vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled);
+    samplesAccumulatedSampler = device.createSampler(samplerInfo);
 }
 
 void VulkanViewer::Impl::createRtPipeline()
 {
-    const std::array<vk::DescriptorSetLayoutBinding, 6> bindings = {
+    const std::array<vk::DescriptorSetLayoutBinding, 7> bindings = {
         vk::DescriptorSetLayoutBinding(0, vk::DescriptorType::eAccelerationStructureKHR, 1,
                                        vk::ShaderStageFlagBits::eRaygenKHR),
         vk::DescriptorSetLayoutBinding(1, vk::DescriptorType::eStorageImage, 1, vk::ShaderStageFlagBits::eRaygenKHR),
@@ -385,6 +400,7 @@ void VulkanViewer::Impl::createRtPipeline()
                                        vk::ShaderStageFlagBits::eClosestHitKHR),
         vk::DescriptorSetLayoutBinding(5, vk::DescriptorType::eStorageBuffer, 1,
                                        vk::ShaderStageFlagBits::eClosestHitKHR),
+        vk::DescriptorSetLayoutBinding(6, vk::DescriptorType::eStorageImage, 1, vk::ShaderStageFlagBits::eRaygenKHR),
     };
     rtSetLayout = device.createDescriptorSetLayout(vk::DescriptorSetLayoutCreateInfo({}, bindings));
 
@@ -743,7 +759,7 @@ void VulkanViewer::Impl::buildScene(GltfScene loaded)
 
     const std::array<vk::DescriptorPoolSize, 4> poolSizes = {
         vk::DescriptorPoolSize(vk::DescriptorType::eAccelerationStructureKHR, 1),
-        vk::DescriptorPoolSize(vk::DescriptorType::eStorageImage, 1),
+        vk::DescriptorPoolSize(vk::DescriptorType::eStorageImage, 2),
         vk::DescriptorPoolSize(vk::DescriptorType::eCombinedImageSampler, 1),
         vk::DescriptorPoolSize(vk::DescriptorType::eStorageBuffer, 3),
     };
@@ -760,7 +776,9 @@ void VulkanViewer::Impl::buildScene(GltfScene loaded)
     const vk::DescriptorBufferInfo uvInfo(*next->texcoords.handle, 0, VK_WHOLE_SIZE);
     const vk::DescriptorBufferInfo indexInfo(*next->indices.handle, 0, VK_WHOLE_SIZE);
     const vk::DescriptorBufferInfo positionInfo(*next->vertices.handle, 0, VK_WHOLE_SIZE);
-    std::array<vk::WriteDescriptorSet, 6> writes{};
+    const vk::DescriptorImageInfo samplesAccumulatedInfo(*samplesAccumulatedSampler, *samplesAccumulated.view,
+                                                         vk::ImageLayout::eGeneral);
+    std::array<vk::WriteDescriptorSet, 7> writes{};
     writes[0]
         .setPNext(&asDescriptor)
         .setDstSet(*next->descriptorSet)
@@ -797,6 +815,12 @@ void VulkanViewer::Impl::buildScene(GltfScene loaded)
         .setDescriptorCount(1)
         .setDescriptorType(vk::DescriptorType::eStorageBuffer)
         .setBufferInfo(positionInfo);
+    writes[6]
+        .setDstSet(*next->descriptorSet)
+        .setDstBinding(6)
+        .setDescriptorCount(1)
+        .setDescriptorType(vk::DescriptorType::eStorageImage)
+        .setImageInfo(samplesAccumulatedInfo);
     device.updateDescriptorSets(writes, {});
 
     const auto properties =
@@ -834,13 +858,14 @@ void VulkanViewer::Impl::buildScene(GltfScene loaded)
     yaw = pitch = 0.0f;
     distance = 3.0f;
     traceDirty = true;
+    sampleIndex = 1;
     status = "Loaded " + std::to_string(scene->triangleCount) + " triangles | " +
         (loaded.hasBaseColorTexture ? "baseColor texture loaded" : "white fallback texture");
 }
 
 void VulkanViewer::Impl::recordTrace(vk::raii::CommandBuffer& commandBuffer)
 {
-    if (!scene || !traceDirty)
+    if (!scene)
         return;
 
     vk::ImageMemoryBarrier prepare;
@@ -857,7 +882,7 @@ void VulkanViewer::Impl::recordTrace(vk::raii::CommandBuffer& commandBuffer)
     commandBuffer.bindPipeline(vk::PipelineBindPoint::eRayTracingKHR, *rtPipeline);
     commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eRayTracingKHR, *rtPipelineLayout, 0, *scene->descriptorSet,
                                      {});
-    const std::array<CameraData, 1> cameraData = {makeCamera(yaw, pitch, distance)};
+    const std::array<CameraData, 1> cameraData = {makeCamera(yaw, pitch, distance, sampleIndex)};
     const vk::ArrayProxy<const CameraData> cameraProxy(1, cameraData.data());
     commandBuffer.pushConstants(*rtPipelineLayout, vk::ShaderStageFlagBits::eRaygenKHR, 0, cameraProxy);
     commandBuffer.traceRaysKHR(scene->raygenRegion, scene->missRegion, scene->hitRegion, scene->callableRegion,
@@ -936,6 +961,7 @@ void VulkanViewer::Impl::drawFrame(ImDrawData* drawData)
     }
     swapchainDirty = swapchainDirty || suboptimal;
     frameIndex = (frameIndex + 1) % kFramesInFlight;
+    sampleIndex++;
 }
 
 VulkanViewer::VulkanViewer(GLFWwindow* window) : impl_(std::make_unique<Impl>(window)) {}
@@ -950,11 +976,13 @@ void VulkanViewer::orbit(float deltaX, float deltaY)
     impl_->yaw += deltaX * 0.008f;
     impl_->pitch = std::clamp(impl_->pitch - deltaY * 0.008f, -1.5f, 1.5f);
     impl_->traceDirty = true;
+    impl_->sampleIndex = 1;
 }
 void VulkanViewer::zoom(float wheelDelta)
 {
     impl_->distance = std::clamp(impl_->distance * std::exp(-wheelDelta * 0.12f), 1.4f, 12.0f);
     impl_->traceDirty = true;
+    impl_->sampleIndex = 1;
 }
 void VulkanViewer::drawFrame(ImDrawData* drawData)
 {
