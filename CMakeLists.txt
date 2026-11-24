@@ -39,7 +39,8 @@ target_link_libraries(imgui PUBLIC glfw Vulkan::Vulkan)
 add_executable(vulkan_gltf_rt
         src/main.cpp
         src/gltf_scene.cpp
-        src/vulkan_viewer.cpp)
+        src/vulkan_viewer.cpp
+        src/info.hpp)
 target_link_libraries(vulkan_gltf_rt PRIVATE Vulkan::Vulkan glfw imgui)
 target_include_directories(vulkan_gltf_rt PRIVATE ${cgltf_SOURCE_DIR} ${stb_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src)
 if (WIN32)

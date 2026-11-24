@@ -1,3 +1,5 @@
+#include "info.hpp"
+
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
 #include <imgui.h>
@@ -63,7 +65,8 @@ int main(int argc, char** argv)
         return EXIT_FAILURE;
     }
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-    GLFWwindow* window = glfwCreateWindow(1600, 900, "Vulkan glTF Ray Tracing", nullptr, nullptr);
+    GLFWwindow* window = glfwCreateWindow(RENDERER_RESOLUTION_WIDTH, RENDERER_RESOLUTION_HEIGHT,
+                                          "Vulkan glTF Ray Tracing", nullptr, nullptr);
     if (!window)
     {
         glfwTerminate();

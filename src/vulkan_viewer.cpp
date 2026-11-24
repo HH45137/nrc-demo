@@ -1,3 +1,4 @@
+#include "info.hpp"
 #include "vulkan_viewer.hpp"
 
 #define GLFW_INCLUDE_VULKAN
@@ -20,8 +21,8 @@
 
 namespace
 {
-    constexpr uint32_t kRenderWidth = 960;
-    constexpr uint32_t kRenderHeight = 540;
+    constexpr uint32_t kRenderWidth = RENDERER_RESOLUTION_WIDTH;
+    constexpr uint32_t kRenderHeight = RENDERER_RESOLUTION_HEIGHT;
     constexpr uint32_t kFramesInFlight = 2;
     constexpr std::array<const char*, 4> kDeviceExtensions = {
         VK_KHR_SWAPCHAIN_EXTENSION_NAME,
