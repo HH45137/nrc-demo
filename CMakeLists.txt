@@ -47,15 +47,19 @@ if (WIN32)
 endif ()
 
 find_program(GLSLANG_VALIDATOR glslangValidator REQUIRED)
-set(RT_SHADER_FILES shaders/raygen.rgen shaders/miss.rmiss shaders/hit.rchit)
+# Stage is explicit because the .glsl suffix does not imply an RT shader stage.
+set(RT_SHADERS raygen:rgen miss:rmiss hit:rchit)
 set(RT_SPIRV_FILES)
-foreach (SHADER IN LISTS RT_SHADER_FILES)
-    get_filename_component(SHADER_NAME ${SHADER} NAME)
+foreach (PAIR IN LISTS RT_SHADERS)
+    string(REPLACE ":" ";" PAIR_FIELDS "${PAIR}")
+    list(GET PAIR_FIELDS 0 SHADER_NAME)
+    list(GET PAIR_FIELDS 1 SHADER_STAGE)
+    set(SHADER_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/shaders/${SHADER_NAME}.glsl)
     set(SPIRV ${CMAKE_CURRENT_BINARY_DIR}/shaders/${SHADER_NAME}.spv)
     add_custom_command(OUTPUT ${SPIRV}
             COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/shaders
-            COMMAND ${GLSLANG_VALIDATOR} --target-env vulkan1.2 -V ${CMAKE_CURRENT_SOURCE_DIR}/${SHADER} -o ${SPIRV}
-            DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${SHADER}
+            COMMAND ${GLSLANG_VALIDATOR} --target-env vulkan1.2 -S ${SHADER_STAGE} -V ${SHADER_SOURCE} -o ${SPIRV}
+            DEPENDS ${SHADER_SOURCE}
             VERBATIM)
     list(APPEND RT_SPIRV_FILES ${SPIRV})
 endforeach ()

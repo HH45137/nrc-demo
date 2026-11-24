@@ -373,7 +373,7 @@ void VulkanViewer::Impl::createOutputImage()
 
 void VulkanViewer::Impl::createRtPipeline()
 {
-    const std::array<vk::DescriptorSetLayoutBinding, 5> bindings = {
+    const std::array<vk::DescriptorSetLayoutBinding, 6> bindings = {
         vk::DescriptorSetLayoutBinding(0, vk::DescriptorType::eAccelerationStructureKHR, 1,
                                        vk::ShaderStageFlagBits::eRaygenKHR),
         vk::DescriptorSetLayoutBinding(1, vk::DescriptorType::eStorageImage, 1, vk::ShaderStageFlagBits::eRaygenKHR),
@@ -383,6 +383,8 @@ void VulkanViewer::Impl::createRtPipeline()
                                        vk::ShaderStageFlagBits::eClosestHitKHR),
         vk::DescriptorSetLayoutBinding(4, vk::DescriptorType::eStorageBuffer, 1,
                                        vk::ShaderStageFlagBits::eClosestHitKHR),
+        vk::DescriptorSetLayoutBinding(5, vk::DescriptorType::eStorageBuffer, 1,
+                                       vk::ShaderStageFlagBits::eClosestHitKHR),
     };
     rtSetLayout = device.createDescriptorSetLayout(vk::DescriptorSetLayoutCreateInfo({}, bindings));
 
@@ -390,9 +392,9 @@ void VulkanViewer::Impl::createRtPipeline()
     rtPipelineLayout = device.createPipelineLayout(vk::PipelineLayoutCreateInfo({}, *rtSetLayout, cameraRange));
 
     const std::array<std::string, 3> shaderPaths = {
-        std::string(RT_SHADER_DIR) + "/raygen.rgen.spv",
-        std::string(RT_SHADER_DIR) + "/miss.rmiss.spv",
-        std::string(RT_SHADER_DIR) + "/hit.rchit.spv",
+        std::string(RT_SHADER_DIR) + "/raygen.spv",
+        std::string(RT_SHADER_DIR) + "/miss.spv",
+        std::string(RT_SHADER_DIR) + "/hit.spv",
     };
     std::array<vk::raii::ShaderModule, 3> shaderModules = {
         vk::raii::ShaderModule(nullptr), vk::raii::ShaderModule(nullptr), vk::raii::ShaderModule(nullptr)};
@@ -743,7 +745,7 @@ void VulkanViewer::Impl::buildScene(GltfScene loaded)
         vk::DescriptorPoolSize(vk::DescriptorType::eAccelerationStructureKHR, 1),
         vk::DescriptorPoolSize(vk::DescriptorType::eStorageImage, 1),
         vk::DescriptorPoolSize(vk::DescriptorType::eCombinedImageSampler, 1),
-        vk::DescriptorPoolSize(vk::DescriptorType::eStorageBuffer, 2),
+        vk::DescriptorPoolSize(vk::DescriptorType::eStorageBuffer, 3),
     };
     next->descriptorPool = device.createDescriptorPool(
         vk::DescriptorPoolCreateInfo(vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet, 1, poolSizes));
@@ -757,7 +759,8 @@ void VulkanViewer::Impl::buildScene(GltfScene loaded)
                                               vk::ImageLayout::eShaderReadOnlyOptimal);
     const vk::DescriptorBufferInfo uvInfo(*next->texcoords.handle, 0, VK_WHOLE_SIZE);
     const vk::DescriptorBufferInfo indexInfo(*next->indices.handle, 0, VK_WHOLE_SIZE);
-    std::array<vk::WriteDescriptorSet, 5> writes{};
+    const vk::DescriptorBufferInfo positionInfo(*next->vertices.handle, 0, VK_WHOLE_SIZE);
+    std::array<vk::WriteDescriptorSet, 6> writes{};
     writes[0]
         .setPNext(&asDescriptor)
         .setDstSet(*next->descriptorSet)
@@ -788,13 +791,18 @@ void VulkanViewer::Impl::buildScene(GltfScene loaded)
         .setDescriptorCount(1)
         .setDescriptorType(vk::DescriptorType::eStorageBuffer)
         .setBufferInfo(indexInfo);
+    writes[5]
+        .setDstSet(*next->descriptorSet)
+        .setDstBinding(5)
+        .setDescriptorCount(1)
+        .setDescriptorType(vk::DescriptorType::eStorageBuffer)
+        .setBufferInfo(positionInfo);
     device.updateDescriptorSets(writes, {});
 
     const auto properties =
         physicalDevice
             .getProperties2<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceRayTracingPipelinePropertiesKHR>();
-    const auto& pipelineProperties =
-        properties.get<vk::PhysicalDeviceRayTracingPipelinePropertiesKHR>();
+    const auto& pipelineProperties = properties.get<vk::PhysicalDeviceRayTracingPipelinePropertiesKHR>();
     const uint32_t handleSize = pipelineProperties.shaderGroupHandleSize;
     const uint32_t handleAlignment = pipelineProperties.shaderGroupHandleAlignment;
     const uint32_t baseAlignment = pipelineProperties.shaderGroupBaseAlignment;
