@@ -980,7 +980,7 @@ void VulkanViewer::orbit(float deltaX, float deltaY)
 }
 void VulkanViewer::zoom(float wheelDelta)
 {
-    impl_->distance = std::clamp(impl_->distance * std::exp(-wheelDelta * 0.12f), 1.4f, 12.0f);
+    impl_->distance = std::clamp(impl_->distance * std::exp(-wheelDelta * 0.12f), 0.1f, 12.0f);
     impl_->traceDirty = true;
     impl_->sampleIndex = 1;
 }
