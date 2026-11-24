@@ -90,7 +90,7 @@ int main(int argc, char** argv)
             ImGui_ImplGlfw_NewFrame();
             ImGui::NewFrame();
 
-            ImGui::SetNextWindowSize(ImVec2(1120, 740), ImGuiCond_FirstUseEver);
+            ImGui::SetNextWindowSize(ImVec2(1280, 720), ImGuiCond_FirstUseEver);
             ImGui::Begin("Vulkan glTF Ray Tracing", nullptr, ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse);
 #ifdef _WIN32
             if (ImGui::Button("Load glTF / GLB"))
