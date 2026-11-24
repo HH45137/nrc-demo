@@ -8,9 +8,134 @@
 #include <algorithm>
 #include <array>
 #include <climits>
+#include <cmath>
 #include <filesystem>
+#include <iterator>
 #include <stdexcept>
 #include <string_view>
+#include <vector>
+
+namespace
+{
+    // Column-major 4x4 matrices, matching glTF's layout.
+    using Mat4 = std::array<float, 16>;
+
+    Mat4 identityMatrix()
+    {
+        Mat4 matrix{};
+        matrix[0] = matrix[5] = matrix[10] = matrix[15] = 1.0f;
+        return matrix;
+    }
+
+    Mat4 multiply(const Mat4& left, const Mat4& right)
+    {
+        Mat4 result{};
+        for (size_t column = 0; column < 4; ++column)
+        {
+            for (size_t row = 0; row < 4; ++row)
+            {
+                result[column * 4 + row] = left[row] * right[column * 4] + left[4 + row] * right[column * 4 + 1] +
+                    left[8 + row] * right[column * 4 + 2] + left[12 + row] * right[column * 4 + 3];
+            }
+        }
+        return result;
+    }
+
+    Mat4 nodeLocalTransform(const cgltf_node& node)
+    {
+        if (node.has_matrix)
+        {
+            Mat4 matrix{};
+            std::copy(std::begin(node.matrix), std::end(node.matrix), matrix.begin());
+            return matrix;
+        }
+
+        const float tx = node.has_translation ? node.translation[0] : 0.0f;
+        const float ty = node.has_translation ? node.translation[1] : 0.0f;
+        const float tz = node.has_translation ? node.translation[2] : 0.0f;
+        const float qx = node.has_rotation ? node.rotation[0] : 0.0f;
+        const float qy = node.has_rotation ? node.rotation[1] : 0.0f;
+        const float qz = node.has_rotation ? node.rotation[2] : 0.0f;
+        const float qw = node.has_rotation ? node.rotation[3] : 1.0f;
+        const float sx = node.has_scale ? node.scale[0] : 1.0f;
+        const float sy = node.has_scale ? node.scale[1] : 1.0f;
+        const float sz = node.has_scale ? node.scale[2] : 1.0f;
+
+        // T * R * S, written directly in column-major order.
+        Mat4 matrix{};
+        matrix[0] = (1.0f - 2.0f * (qy * qy + qz * qz)) * sx;
+        matrix[1] = 2.0f * (qx * qy + qz * qw) * sx;
+        matrix[2] = 2.0f * (qx * qz - qy * qw) * sx;
+        matrix[4] = 2.0f * (qx * qy - qz * qw) * sy;
+        matrix[5] = (1.0f - 2.0f * (qx * qx + qz * qz)) * sy;
+        matrix[6] = 2.0f * (qy * qz + qx * qw) * sy;
+        matrix[8] = 2.0f * (qx * qz + qy * qw) * sz;
+        matrix[9] = 2.0f * (qy * qz - qx * qw) * sz;
+        matrix[10] = (1.0f - 2.0f * (qx * qx + qy * qy)) * sz;
+        matrix[12] = tx;
+        matrix[13] = ty;
+        matrix[14] = tz;
+        matrix[15] = 1.0f;
+        return matrix;
+    }
+
+    void collectMeshTransforms(const cgltf_node& node, const cgltf_data& data, const Mat4& parent,
+                               std::vector<Mat4>& transforms, std::vector<bool>& assigned)
+    {
+        const Mat4 world = multiply(parent, nodeLocalTransform(node));
+        if (node.mesh)
+        {
+            const size_t meshIndex = static_cast<size_t>(node.mesh - data.meshes);
+            if (meshIndex < transforms.size() && !assigned[meshIndex])
+            {
+                transforms[meshIndex] = world;
+                assigned[meshIndex] = true;
+            }
+        }
+        for (size_t i = 0; i < node.children_count; ++i)
+            collectMeshTransforms(*node.children[i], data, world, transforms, assigned);
+    }
+
+    std::vector<Mat4> collectSceneMeshTransforms(const cgltf_data& data)
+    {
+        std::vector<Mat4> transforms(data.meshes_count, identityMatrix());
+        std::vector<bool> assigned(data.meshes_count, false);
+
+        if (data.scene)
+        {
+            for (size_t i = 0; i < data.scene->nodes_count; ++i)
+                collectMeshTransforms(*data.scene->nodes[i], data, identityMatrix(), transforms, assigned);
+        }
+        else
+        {
+            // No explicit scene: treat nodes without a parent as roots.
+            for (size_t i = 0; i < data.nodes_count; ++i)
+            {
+                if (!data.nodes[i].parent)
+                    collectMeshTransforms(data.nodes[i], data, identityMatrix(), transforms, assigned);
+            }
+        }
+        return transforms;
+    }
+
+    void transformPosition(const Mat4& matrix, float* position)
+    {
+        const float x = position[0];
+        const float y = position[1];
+        const float z = position[2];
+        position[0] = matrix[0] * x + matrix[4] * y + matrix[8] * z + matrix[12];
+        position[1] = matrix[1] * x + matrix[5] * y + matrix[9] * z + matrix[13];
+        position[2] = matrix[2] * x + matrix[6] * y + matrix[10] * z + matrix[14];
+
+        const float w = matrix[3] * x + matrix[7] * y + matrix[11] * z + matrix[15];
+        if (std::abs(w) > 1e-8f)
+        {
+            position[0] /= w;
+            position[1] /= w;
+            position[2] /= w;
+        }
+    }
+} // namespace
 
 GltfScene loadGltfScene(const std::string& path)
 {
@@ -26,9 +151,13 @@ GltfScene loadGltfScene(const std::string& path)
     }
 
     GltfScene scene;
+    // glTF stores mesh vertices in object space. Apply the world transform of the
+    // first node that references each mesh so node rotations/scales are honored.
+    const std::vector<Mat4> meshTransforms = collectSceneMeshTransforms(*data);
     for (size_t meshIndex = 0; meshIndex < data->meshes_count && scene.positions.empty(); ++meshIndex)
     {
         const cgltf_mesh& mesh = data->meshes[meshIndex];
+        const Mat4& meshTransform = meshTransforms[meshIndex];
         for (size_t primitiveIndex = 0; primitiveIndex < mesh.primitives_count && scene.positions.empty();
              ++primitiveIndex)
         {
@@ -55,6 +184,7 @@ GltfScene loadGltfScene(const std::string& path)
             {
                 if (!cgltf_accessor_read_float(positions, i, &scene.positions[i * 3], 3))
                     throw std::runtime_error("Cannot read POSITION accessor");
+                transformPosition(meshTransform, &scene.positions[i * 3]);
             }
             if (texcoords)
             {

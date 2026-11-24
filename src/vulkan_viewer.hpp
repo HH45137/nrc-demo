@@ -20,11 +20,15 @@ public:
     VulkanViewer& operator=(const VulkanViewer&) = delete;
 
     void loadScene(GltfScene scene);
-    void orbit(float deltaX, float deltaY);
+    void rotateView(float deltaX, float deltaY);
     void zoom(float wheelDelta);
+    void move(float forwardAxis, float rightAxis, float upAxis, float deltaSeconds, bool boost);
+    void setFirstPerson(bool enabled);
     void drawFrame(ImDrawData* drawData);
 
     [[nodiscard]] bool hasScene() const;
+    [[nodiscard]] bool isFirstPerson() const;
+    [[nodiscard]] float moveSpeed() const;
     [[nodiscard]] ImTextureID sceneTexture() const;
     [[nodiscard]] const std::string& sceneStatus() const;
 

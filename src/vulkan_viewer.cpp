@@ -36,39 +36,85 @@ namespace
         alignas(16) float right[4];
         alignas(16) float up[4];
         alignas(16) float forward[4];
-        alignas(4) int sampleIndex;
+        alignas(4) uint32_t sampleIndex;
         alignas(4) int _pad0;
         alignas(4) int _pad1;
         alignas(4) int _pad2;
     };
 
-    CameraData makeCamera(float yaw, float pitch, float distance, unsigned int sampleIndex)
+    // Shared camera state. Orbit mode derives the position from yaw/pitch/distance;
+    // first-person mode keeps an explicit world position and uses yaw/pitch as the
+    // look direction. Toggling between modes converts yaw/pitch so the view
+    // direction is preserved.
+    struct CameraState
     {
-        const float cp = std::cos(pitch);
-        const float sp = std::sin(pitch);
-        const float sy = std::sin(yaw);
-        const float cy = std::cos(yaw);
+        float yaw{}, pitch{};
+        float distance{3.0f};
+        std::array<float, 3> position{0.0f, 0.0f, 3.0f};
+        bool firstPerson{};
+    };
+
+    CameraData makeCamera(const CameraState& state, uint32_t sampleIndex)
+    {
+        const float cp = std::cos(state.pitch);
+        const float sp = std::sin(state.pitch);
+        const float sy = std::sin(state.yaw);
+        const float cy = std::cos(state.yaw);
+
+        float px = 0.0f, py = 0.0f, pz = 0.0f;
+        float fx = 0.0f, fy = 0.0f, fz = 0.0f;
+        if (state.firstPerson)
+        {
+            px = state.position[0];
+            py = state.position[1];
+            pz = state.position[2];
+
+            // yaw = 0 looks down -Z; positive yaw turns right, positive pitch looks up.
+            fx = sy * cp;
+            fy = sp;
+            fz = -cy * cp;
+        }
+        else
+        {
+            px = state.distance * cp * sy;
+            py = state.distance * sp;
+            pz = state.distance * cp * cy;
+
+            const float length = std::sqrt(px * px + py * py + pz * pz);
+            fx = -px / length;
+            fy = -py / length;
+            fz = -pz / length;
+        }
+
+        // right = normalize(cross(forward, worldUp)); worldUp is +Y.
+        float rx = -fz;
+        float rz = fx;
+        const float rightLength = std::sqrt(rx * rx + rz * rz);
+        if (rightLength > 1e-6f)
+        {
+            rx /= rightLength;
+            rz /= rightLength;
+        }
+        else
+        {
+            rx = 1.0f;
+            rz = 0.0f;
+        }
 
         CameraData camera{};
-        camera.origin[0] = distance * cp * sy;
-        camera.origin[1] = distance * sp;
-        camera.origin[2] = distance * cp * cy;
-        const float length = std::sqrt(camera.origin[0] * camera.origin[0] + camera.origin[1] * camera.origin[1] +
-                                       camera.origin[2] * camera.origin[2]);
-        for (size_t axis = 0; axis < 3; ++axis)
-            camera.forward[axis] = -camera.origin[axis] / length;
-
-        camera.right[0] = -camera.forward[2];
-        camera.right[2] = camera.forward[0];
-        const float rightLength = std::sqrt(camera.right[0] * camera.right[0] + camera.right[2] * camera.right[2]);
-        camera.right[0] /= rightLength;
-        camera.right[2] /= rightLength;
-        camera.up[0] = camera.right[1] * camera.forward[2] - camera.right[2] * camera.forward[1];
-        camera.up[1] = camera.right[2] * camera.forward[0] - camera.right[0] * camera.forward[2];
-        camera.up[2] = camera.right[0] * camera.forward[1] - camera.right[1] * camera.forward[0];
-
+        camera.origin[0] = px;
+        camera.origin[1] = py;
+        camera.origin[2] = pz;
+        camera.right[0] = rx;
+        camera.right[2] = rz;
+        camera.forward[0] = fx;
+        camera.forward[1] = fy;
+        camera.forward[2] = fz;
+        // up = cross(right, forward)
+        camera.up[0] = -rz * fy;
+        camera.up[1] = rz * fx - rx * fz;
+        camera.up[2] = rx * fy;
         camera.sampleIndex = sampleIndex;
-
         return camera;
     }
 
@@ -112,7 +158,7 @@ struct VulkanViewer::Impl
     {
         Buffer vertices, texcoords, indices, instance, blasStorage, tlasStorage, sbt;
         vk::raii::AccelerationStructureKHR blas{nullptr}, tlas{nullptr};
-        Image baseColor, samplesAccumulated;
+        Image baseColor;
         vk::raii::Sampler sampler{nullptr};
         vk::raii::DescriptorPool descriptorPool{nullptr};
         vk::raii::DescriptorSet descriptorSet{nullptr};
@@ -159,15 +205,14 @@ struct VulkanViewer::Impl
     vk::raii::DescriptorPool imguiDescriptorPool{nullptr};
     Image output, samplesAccumulated;
     vk::raii::Sampler outputSampler{nullptr};
-    vk::raii::Sampler samplesAccumulatedSampler{nullptr};
     VkDescriptorSet imguiOutputSet{};
     bool outputInitialized{};
     uint32_t minImageCount{2};
 
     std::unique_ptr<Scene> scene;
     std::string status{"No scene loaded"};
-    float yaw{}, pitch{}, distance{3.0f};
-    bool traceDirty{};
+    CameraState camera;
+    float moveSpeed{2.0f};
 
     explicit Impl(GLFWwindow* glfwWindow) : window(glfwWindow)
     {
@@ -380,10 +425,22 @@ void VulkanViewer::Impl::createAllImages()
     samplerInfo.maxLod = 0.0f;
     outputSampler = device.createSampler(samplerInfo);
 
-    // Samples accumulated
-    samplesAccumulated = createImage(kRenderWidth, kRenderHeight, vk::Format::eR32G32B32A32Sfloat,
-                                     vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled);
-    samplesAccumulatedSampler = device.createSampler(samplerInfo);
+    // Samples accumulated: linear HDR mean of all samples for each pixel.
+    samplesAccumulated =
+        createImage(kRenderWidth, kRenderHeight, vk::Format::eR32G32B32A32Sfloat, vk::ImageUsageFlagBits::eStorage);
+    immediateSubmit(
+        [&](vk::raii::CommandBuffer& commandBuffer)
+        {
+            vk::ImageMemoryBarrier toGeneral;
+            toGeneral.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+            toGeneral.oldLayout = vk::ImageLayout::eUndefined;
+            toGeneral.newLayout = vk::ImageLayout::eGeneral;
+            toGeneral.srcQueueFamilyIndex = toGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            toGeneral.image = *samplesAccumulated.handle;
+            toGeneral.subresourceRange = vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1);
+            commandBuffer.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,
+                                          vk::PipelineStageFlagBits::eRayTracingShaderKHR, {}, {}, {}, toGeneral);
+        });
 }
 
 void VulkanViewer::Impl::createRtPipeline()
@@ -776,8 +833,9 @@ void VulkanViewer::Impl::buildScene(GltfScene loaded)
     const vk::DescriptorBufferInfo uvInfo(*next->texcoords.handle, 0, VK_WHOLE_SIZE);
     const vk::DescriptorBufferInfo indexInfo(*next->indices.handle, 0, VK_WHOLE_SIZE);
     const vk::DescriptorBufferInfo positionInfo(*next->vertices.handle, 0, VK_WHOLE_SIZE);
-    const vk::DescriptorImageInfo samplesAccumulatedInfo(*samplesAccumulatedSampler, *samplesAccumulated.view,
-                                                         vk::ImageLayout::eGeneral);
+    vk::DescriptorImageInfo samplesAccumulatedInfo{};
+    samplesAccumulatedInfo.imageView = *samplesAccumulated.view;
+    samplesAccumulatedInfo.imageLayout = vk::ImageLayout::eGeneral;
     std::array<vk::WriteDescriptorSet, 7> writes{};
     writes[0]
         .setPNext(&asDescriptor)
@@ -855,9 +913,13 @@ void VulkanViewer::Impl::buildScene(GltfScene loaded)
     next->triangleCount = triangleCount;
 
     scene = std::move(next);
-    yaw = pitch = 0.0f;
-    distance = 3.0f;
-    traceDirty = true;
+    const bool keepFirstPerson = camera.firstPerson;
+    camera = CameraState{};
+    camera.firstPerson = keepFirstPerson;
+    // Look from -Z toward the origin: the DamagedHelmet node rotation leaves its
+    // front facing that way. Keep the first-person spawn on the same side.
+    camera.yaw = 3.14159265f;
+    camera.position = {0.0f, 0.0f, -camera.distance};
     sampleIndex = 1;
     status = "Loaded " + std::to_string(scene->triangleCount) + " triangles | " +
         (loaded.hasBaseColorTexture ? "baseColor texture loaded" : "white fallback texture");
@@ -879,10 +941,19 @@ void VulkanViewer::Impl::recordTrace(vk::raii::CommandBuffer& commandBuffer)
     commandBuffer.pipelineBarrier(outputInitialized ? vk::PipelineStageFlagBits::eFragmentShader
                                                     : vk::PipelineStageFlagBits::eTopOfPipe,
                                   vk::PipelineStageFlagBits::eRayTracingShaderKHR, {}, {}, {}, prepare);
+
+    // Make the previous frame's accumulation writes visible to this dispatch.
+    const vk::ImageMemoryBarrier accumulate(
+        vk::AccessFlagBits::eShaderWrite, vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite,
+        vk::ImageLayout::eGeneral, vk::ImageLayout::eGeneral, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        *samplesAccumulated.handle, vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1));
+    commandBuffer.pipelineBarrier(vk::PipelineStageFlagBits::eRayTracingShaderKHR,
+                                  vk::PipelineStageFlagBits::eRayTracingShaderKHR, {}, {}, {}, accumulate);
+
     commandBuffer.bindPipeline(vk::PipelineBindPoint::eRayTracingKHR, *rtPipeline);
     commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eRayTracingKHR, *rtPipelineLayout, 0, *scene->descriptorSet,
                                      {});
-    const std::array<CameraData, 1> cameraData = {makeCamera(yaw, pitch, distance, sampleIndex)};
+    const std::array<CameraData, 1> cameraData = {makeCamera(camera, sampleIndex)};
     const vk::ArrayProxy<const CameraData> cameraProxy(1, cameraData.data());
     commandBuffer.pushConstants(*rtPipelineLayout, vk::ShaderStageFlagBits::eRaygenKHR, 0, cameraProxy);
     commandBuffer.traceRaysKHR(scene->raygenRegion, scene->missRegion, scene->hitRegion, scene->callableRegion,
@@ -894,7 +965,6 @@ void VulkanViewer::Impl::recordTrace(vk::raii::CommandBuffer& commandBuffer)
     commandBuffer.pipelineBarrier(vk::PipelineStageFlagBits::eRayTracingShaderKHR,
                                   vk::PipelineStageFlagBits::eFragmentShader, {}, {}, {}, sampled);
     outputInitialized = true;
-    traceDirty = false;
 }
 
 void VulkanViewer::Impl::drawFrame(ImDrawData* drawData)
@@ -971,17 +1041,88 @@ void VulkanViewer::loadScene(GltfScene scene)
 {
     impl_->buildScene(std::move(scene));
 }
-void VulkanViewer::orbit(float deltaX, float deltaY)
+void VulkanViewer::rotateView(float deltaX, float deltaY)
 {
-    impl_->yaw += deltaX * 0.008f;
-    impl_->pitch = std::clamp(impl_->pitch - deltaY * 0.008f, -1.5f, 1.5f);
-    impl_->traceDirty = true;
+    // Shared by both modes: drag right turns right, drag up looks up.
+    // First-person uses a lower sensitivity because the camera rotates in place.
+    CameraState& camera = impl_->camera;
+    const float sensitivity = camera.firstPerson ? 0.0025f : 0.008f;
+    camera.yaw += deltaX * sensitivity;
+    camera.pitch = std::clamp(camera.pitch - deltaY * sensitivity, -1.5f, 1.5f);
     impl_->sampleIndex = 1;
 }
 void VulkanViewer::zoom(float wheelDelta)
 {
-    impl_->distance = std::clamp(impl_->distance * std::exp(-wheelDelta * 0.12f), 0.1f, 12.0f);
-    impl_->traceDirty = true;
+    CameraState& camera = impl_->camera;
+    if (camera.firstPerson)
+        impl_->moveSpeed = std::clamp(impl_->moveSpeed * std::exp(wheelDelta * 0.15f), 0.2f, 20.0f);
+    else
+        camera.distance = std::clamp(camera.distance * std::exp(-wheelDelta * 0.12f), 1.4f, 12.0f);
+    impl_->sampleIndex = 1;
+}
+void VulkanViewer::move(float forwardAxis, float rightAxis, float upAxis, float deltaSeconds, bool boost)
+{
+    CameraState& camera = impl_->camera;
+    if (!camera.firstPerson || !impl_->scene)
+        return;
+    if (forwardAxis == 0.0f && rightAxis == 0.0f && upAxis == 0.0f)
+        return;
+
+    const float cp = std::cos(camera.pitch);
+    const float sp = std::sin(camera.pitch);
+    const float sy = std::sin(camera.yaw);
+    const float cy = std::cos(camera.yaw);
+
+    // Full look direction for forward/back, horizontal right for strafing,
+    // and world +Y for Q/E so vertical movement stays intuitive.
+    const float forwardX = sy * cp;
+    const float forwardY = sp;
+    const float forwardZ = -cy * cp;
+    const float rightX = cy;
+    const float rightZ = sy;
+
+    // Clamp the combined input length so diagonal movement is not faster.
+    float length = std::sqrt(forwardAxis * forwardAxis + rightAxis * rightAxis + upAxis * upAxis);
+    if (length > 1.0f)
+    {
+        forwardAxis /= length;
+        rightAxis /= length;
+        upAxis /= length;
+    }
+
+    const float step = impl_->moveSpeed * (boost ? 4.0f : 1.0f) * deltaSeconds;
+    camera.position[0] += (forwardX * forwardAxis + rightX * rightAxis) * step;
+    camera.position[1] += (forwardY * forwardAxis + upAxis) * step;
+    camera.position[2] += (forwardZ * forwardAxis + rightZ * rightAxis) * step;
+    impl_->sampleIndex = 1;
+}
+void VulkanViewer::setFirstPerson(bool enabled)
+{
+    CameraState& camera = impl_->camera;
+    if (camera.firstPerson == enabled)
+        return;
+
+    if (enabled)
+    {
+        // Start where the orbit camera is, looking in the same direction.
+        const float cp = std::cos(camera.pitch);
+        const float sp = std::sin(camera.pitch);
+        camera.position = {camera.distance * cp * std::sin(camera.yaw), camera.distance * sp,
+                           camera.distance * cp * std::cos(camera.yaw)};
+    }
+    else
+    {
+        const float length =
+            std::sqrt(camera.position[0] * camera.position[0] + camera.position[1] * camera.position[1] +
+                      camera.position[2] * camera.position[2]);
+        camera.distance = std::clamp(length, 0.5f, 50.0f);
+    }
+
+    // The two modes use opposite yaw/pitch conventions; negating both keeps the
+    // current view direction when switching.
+    camera.yaw = -camera.yaw;
+    camera.pitch = -camera.pitch;
+    camera.firstPerson = enabled;
     impl_->sampleIndex = 1;
 }
 void VulkanViewer::drawFrame(ImDrawData* drawData)
@@ -991,6 +1132,14 @@ void VulkanViewer::drawFrame(ImDrawData* drawData)
 bool VulkanViewer::hasScene() const
 {
     return static_cast<bool>(impl_->scene);
+}
+bool VulkanViewer::isFirstPerson() const
+{
+    return impl_->camera.firstPerson;
+}
+float VulkanViewer::moveSpeed() const
+{
+    return impl_->moveSpeed;
 }
 ImTextureID VulkanViewer::sceneTexture() const
 {
