@@ -147,9 +147,6 @@ namespace
         if (existing != textureIndices.end())
             return existing->second;
 
-        if (scene.textures.size() >= kMaxGltfTextures)
-            return 0;
-
         GltfTexture loaded;
         if (!loadTexture(*image, scenePath, loaded))
             return 0;

@@ -10,7 +10,7 @@ The renderer is a progressive Monte Carlo path tracer. Each frame adds one cosin
 
 - CMake 3.24+
 - C++20 compiler
-- Vulkan 1.2 SDK and a driver exposing `VK_KHR_acceleration_structure`, `VK_KHR_ray_tracing_pipeline`, and `VK_KHR_deferred_host_operations`
+- Vulkan 1.2 SDK and a driver exposing `VK_KHR_acceleration_structure`, `VK_KHR_ray_tracing_pipeline`, `VK_KHR_deferred_host_operations`, and the Vulkan 1.2 descriptor-indexing features used for bindless textures
 - `glslangValidator` (normally installed with the Vulkan SDK)
 - Network access on first configure to fetch cgltf, GLFW, Dear ImGui, and stb_image
 
@@ -33,7 +33,8 @@ Camera controls:
 
 - Loads `.gltf` with external buffers and `.glb` through cgltf.
 - Renders all triangle primitives reachable from the glTF scene graph, applying each node's world transform. Instanced mesh nodes are duplicated into the merged geometry. Skinning, morph targets and animations are not handled, and material factors are ignored.
-- Samples a per-triangle base-color texture from a 16-slot descriptor array (embedded GLB bufferView or external image URI). More than 16 distinct textures fall back to white, and other PBR maps / texture transforms are not handled.
+- Samples a per-triangle base-color texture through a bindless runtime descriptor array (`GL_EXT_nonuniform_qualifier`). The number of distinct textures is limited only by the device's sampler limits (capped at 65536). Embedded GLB bufferViews and external image URIs are supported; other PBR maps / texture transforms are not handled.
+- All textures are decoded and uploaded at scene load and stay resident. Bindless removes the descriptor-count limit, not the VRAM/upload-time limit; there is no streaming or mipmap generation yet.
 - Path-tracing shaders live in `shaders/raygen.glsl`, `shaders/miss.glsl`, and `shaders/hit.glsl`; CMake compiles them to SPIR-V and the RT pipeline uses recursion depth 1.
 - Renders into a Vulkan storage/sampled image, then displays that image through the Dear ImGui Vulkan backend in the Vulkan swapchain.
 - Uses Vulkan-Hpp RAII handles and generated dispatch; application code does not load Vulkan function pointers manually.

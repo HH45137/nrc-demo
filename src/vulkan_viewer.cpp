@@ -170,7 +170,6 @@ struct VulkanViewer::Impl
     struct FrameSync
     {
         vk::raii::Semaphore imageAvailable{nullptr};
-        vk::raii::Semaphore renderFinished{nullptr};
         vk::raii::Fence fence{nullptr};
     };
 
@@ -183,10 +182,12 @@ struct VulkanViewer::Impl
     vk::raii::Queue queue{nullptr};
     uint32_t queueFamily{};
     uint32_t scratchAlignment{1};
+    uint32_t maxBindlessTextures{1};
 
     vk::raii::CommandPool commandPool{nullptr};
     std::vector<vk::raii::CommandBuffer> commandBuffers;
     std::array<FrameSync, kFramesInFlight> frames;
+    std::vector<vk::raii::Semaphore> renderFinished;
     uint32_t frameIndex{};
     uint32_t sampleIndex{};
 
@@ -255,9 +256,11 @@ struct VulkanViewer::Impl
         Buffer result;
         result.handle = vk::raii::Buffer(device, vk::BufferCreateInfo({}, size, usage, vk::SharingMode::eExclusive));
         const vk::MemoryRequirements requirements = result.handle.getMemoryRequirements();
+        const bool needsAddress = static_cast<bool>(usage & vk::BufferUsageFlagBits::eShaderDeviceAddress);
         vk::MemoryAllocateFlagsInfo addressFlags(vk::MemoryAllocateFlagBits::eDeviceAddress);
         vk::MemoryAllocateInfo allocation(requirements.size, findMemoryType(requirements.memoryTypeBits, memoryFlags));
-        allocation.pNext = &addressFlags;
+        if (needsAddress)
+            allocation.pNext = &addressFlags;
         result.memory = vk::raii::DeviceMemory(device, allocation);
         result.handle.bindMemory(*result.memory, 0);
         if (initialData)
@@ -266,7 +269,8 @@ struct VulkanViewer::Impl
             std::memcpy(mapped, initialData, static_cast<size_t>(size));
             result.memory.unmapMemory();
         }
-        result.address = device.getBufferAddress(vk::BufferDeviceAddressInfo(*result.handle));
+        if (needsAddress)
+            result.address = device.getBufferAddress(vk::BufferDeviceAddressInfo(*result.handle));
         return result;
     }
 
@@ -304,44 +308,81 @@ struct VulkanViewer::Impl
         queue.waitIdle();
     }
 
-    Image uploadTexture(const GltfTexture& texture)
+    std::vector<Image> uploadTextures(const std::vector<GltfTexture>& textures)
     {
-        Image result = createImage(texture.width, texture.height, vk::Format::eR8G8B8A8Srgb,
-                                   vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled);
-        Buffer staging = createBuffer(
-            texture.rgba.size(), vk::BufferUsageFlagBits::eTransferSrc,
-            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent, texture.rgba.data());
+        std::vector<Image> images;
+        images.reserve(textures.size());
+
+        size_t totalBytes = 0;
+        for (const GltfTexture& texture : textures)
+            totalBytes += texture.rgba.size();
+
+        // Pack all pixels into one staging buffer and record every copy in a
+        // single command buffer. This avoids per-texture allocations and queue
+        // stalls when a scene has many textures.
+        Buffer staging =
+            createBuffer(totalBytes, vk::BufferUsageFlagBits::eTransferSrc,
+                         vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+        {
+            void* mapped = staging.memory.mapMemory(0, totalBytes);
+            size_t offset = 0;
+            for (const GltfTexture& texture : textures)
+            {
+                std::memcpy(static_cast<uint8_t*>(mapped) + offset, texture.rgba.data(), texture.rgba.size());
+                offset += texture.rgba.size();
+            }
+            staging.memory.unmapMemory();
+        }
+
+        for (const GltfTexture& texture : textures)
+        {
+            images.push_back(createImage(texture.width, texture.height, vk::Format::eR8G8B8A8Srgb,
+                                         vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled));
+        }
+
         immediateSubmit(
             [&](vk::raii::CommandBuffer& commandBuffer)
             {
-                vk::ImageMemoryBarrier toTransfer;
-                toTransfer.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
-                toTransfer.oldLayout = vk::ImageLayout::eUndefined;
-                toTransfer.newLayout = vk::ImageLayout::eTransferDstOptimal;
-                toTransfer.srcQueueFamilyIndex = toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                toTransfer.image = *result.handle;
-                toTransfer.subresourceRange = vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1);
-                commandBuffer.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,
-                                              vk::PipelineStageFlagBits::eTransfer, {}, {}, {}, toTransfer);
+                size_t offset = 0;
+                for (size_t i = 0; i < textures.size(); ++i)
+                {
+                    const GltfTexture& texture = textures[i];
+                    Image& image = images[i];
 
-                vk::BufferImageCopy copy;
-                copy.imageSubresource = vk::ImageSubresourceLayers(vk::ImageAspectFlagBits::eColor, 0, 0, 1);
-                copy.imageExtent = vk::Extent3D(texture.width, texture.height, 1);
-                commandBuffer.copyBufferToImage(*staging.handle, *result.handle, vk::ImageLayout::eTransferDstOptimal,
-                                                copy);
+                    vk::ImageMemoryBarrier toTransfer;
+                    toTransfer.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+                    toTransfer.oldLayout = vk::ImageLayout::eUndefined;
+                    toTransfer.newLayout = vk::ImageLayout::eTransferDstOptimal;
+                    toTransfer.srcQueueFamilyIndex = toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    toTransfer.image = *image.handle;
+                    toTransfer.subresourceRange =
+                        vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1);
+                    commandBuffer.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,
+                                                  vk::PipelineStageFlagBits::eTransfer, {}, {}, {}, toTransfer);
 
-                vk::ImageMemoryBarrier toShader;
-                toShader.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
-                toShader.dstAccessMask = vk::AccessFlagBits::eShaderRead;
-                toShader.oldLayout = vk::ImageLayout::eTransferDstOptimal;
-                toShader.newLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
-                toShader.srcQueueFamilyIndex = toShader.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                toShader.image = *result.handle;
-                toShader.subresourceRange = vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1);
-                commandBuffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-                                              vk::PipelineStageFlagBits::eRayTracingShaderKHR, {}, {}, {}, toShader);
+                    vk::BufferImageCopy copy;
+                    copy.bufferOffset = offset;
+                    copy.imageSubresource = vk::ImageSubresourceLayers(vk::ImageAspectFlagBits::eColor, 0, 0, 1);
+                    copy.imageExtent = vk::Extent3D(texture.width, texture.height, 1);
+                    commandBuffer.copyBufferToImage(*staging.handle, *image.handle,
+                                                    vk::ImageLayout::eTransferDstOptimal, copy);
+
+                    vk::ImageMemoryBarrier toShader;
+                    toShader.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+                    toShader.dstAccessMask = vk::AccessFlagBits::eShaderRead;
+                    toShader.oldLayout = vk::ImageLayout::eTransferDstOptimal;
+                    toShader.newLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
+                    toShader.srcQueueFamilyIndex = toShader.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    toShader.image = *image.handle;
+                    toShader.subresourceRange = vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1);
+                    commandBuffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                                                  vk::PipelineStageFlagBits::eRayTracingShaderKHR, {}, {}, {},
+                                                  toShader);
+
+                    offset += texture.rgba.size();
+                }
             });
-        return result;
+        return images;
     }
 
     void createInstanceAndDevice();
@@ -416,31 +457,47 @@ void VulkanViewer::Impl::createInstanceAndDevice()
     scratchAlignment = std::max(1u, accelerationProperties.minAccelerationStructureScratchOffsetAlignment);
 
     const auto supportedFeatures =
-        physicalDevice.getFeatures2<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceBufferDeviceAddressFeatures,
+        physicalDevice.getFeatures2<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan12Features,
                                     vk::PhysicalDeviceAccelerationStructureFeaturesKHR,
                                     vk::PhysicalDeviceRayTracingPipelineFeaturesKHR>();
-    if (!supportedFeatures.get<vk::PhysicalDeviceBufferDeviceAddressFeatures>().bufferDeviceAddress ||
+    const vk::PhysicalDeviceVulkan12Features& supportedVulkan12 =
+        supportedFeatures.get<vk::PhysicalDeviceVulkan12Features>();
+    if (!supportedVulkan12.bufferDeviceAddress ||
         !supportedFeatures.get<vk::PhysicalDeviceAccelerationStructureFeaturesKHR>().accelerationStructure ||
         !supportedFeatures.get<vk::PhysicalDeviceRayTracingPipelineFeaturesKHR>().rayTracingPipeline)
         throw std::runtime_error("The selected device does not support required Vulkan RT features");
+    if (!supportedVulkan12.runtimeDescriptorArray || !supportedVulkan12.descriptorBindingVariableDescriptorCount ||
+        !supportedVulkan12.shaderSampledImageArrayNonUniformIndexing)
+        throw std::runtime_error("The selected device does not support bindless sampled-image arrays");
 
     const vk::PhysicalDeviceFeatures coreFeatures = physicalDevice.getFeatures();
     if (!coreFeatures.shaderSampledImageArrayDynamicIndexing)
         throw std::runtime_error("The selected device cannot dynamically index sampled-image arrays");
 
+    // A runtime descriptor array still needs a non-zero layout bound for the RT
+    // pipeline. Use the device limit as the layout maximum, but allocate only
+    // the number of textures that the scene actually needs.
+    const vk::PhysicalDeviceLimits limits = physicalDevice.getProperties().limits;
+    maxBindlessTextures =
+        std::max(1u, std::min({limits.maxPerStageDescriptorSamplers, limits.maxDescriptorSetSamplers, 65536u}));
+
+    vk::PhysicalDeviceVulkan12Features vulkan12Features;
+    vulkan12Features.bufferDeviceAddress = true;
+    vulkan12Features.runtimeDescriptorArray = true;
+    vulkan12Features.descriptorBindingVariableDescriptorCount = true;
+    vulkan12Features.shaderSampledImageArrayNonUniformIndexing = true;
+
     vk::PhysicalDeviceRayTracingPipelineFeaturesKHR rayTracingFeatures;
     vk::PhysicalDeviceAccelerationStructureFeaturesKHR accelerationFeatures;
-    vk::PhysicalDeviceBufferDeviceAddressFeatures addressFeatures;
-    addressFeatures.pNext = &accelerationFeatures;
     accelerationFeatures.pNext = &rayTracingFeatures;
-    addressFeatures.bufferDeviceAddress = true;
+    vulkan12Features.pNext = &accelerationFeatures;
     accelerationFeatures.accelerationStructure = true;
     rayTracingFeatures.rayTracingPipeline = true;
 
-    // Materials are selected per hit through a fixed descriptor array.
+    // Materials are selected per hit through a runtime descriptor array.
     vk::PhysicalDeviceFeatures2 coreFeatureChain;
     coreFeatureChain.features.shaderSampledImageArrayDynamicIndexing = VK_TRUE;
-    coreFeatureChain.pNext = &addressFeatures;
+    coreFeatureChain.pNext = &vulkan12Features;
     const float priority = 1.0f;
     vk::DeviceQueueCreateInfo queueInfo({}, queueFamily, 1, &priority);
     vk::DeviceCreateInfo deviceInfo;
@@ -499,7 +556,7 @@ void VulkanViewer::Impl::createRtPipeline()
         vk::DescriptorSetLayoutBinding(0, vk::DescriptorType::eAccelerationStructureKHR, 1,
                                        vk::ShaderStageFlagBits::eRaygenKHR),
         vk::DescriptorSetLayoutBinding(1, vk::DescriptorType::eStorageImage, 1, vk::ShaderStageFlagBits::eRaygenKHR),
-        vk::DescriptorSetLayoutBinding(2, vk::DescriptorType::eCombinedImageSampler, kMaxGltfTextures,
+        vk::DescriptorSetLayoutBinding(2, vk::DescriptorType::eStorageBuffer, 1,
                                        vk::ShaderStageFlagBits::eClosestHitKHR),
         vk::DescriptorSetLayoutBinding(3, vk::DescriptorType::eStorageBuffer, 1,
                                        vk::ShaderStageFlagBits::eClosestHitKHR),
@@ -508,10 +565,20 @@ void VulkanViewer::Impl::createRtPipeline()
         vk::DescriptorSetLayoutBinding(5, vk::DescriptorType::eStorageBuffer, 1,
                                        vk::ShaderStageFlagBits::eClosestHitKHR),
         vk::DescriptorSetLayoutBinding(6, vk::DescriptorType::eStorageImage, 1, vk::ShaderStageFlagBits::eRaygenKHR),
-        vk::DescriptorSetLayoutBinding(7, vk::DescriptorType::eStorageBuffer, 1,
+        // Runtime array: the layout declares the device maximum, while each
+        // descriptor set allocates only the number of textures it actually uses.
+        vk::DescriptorSetLayoutBinding(7, vk::DescriptorType::eCombinedImageSampler, maxBindlessTextures,
                                        vk::ShaderStageFlagBits::eClosestHitKHR),
     };
-    rtSetLayout = device.createDescriptorSetLayout(vk::DescriptorSetLayoutCreateInfo({}, bindings));
+
+    std::array<vk::DescriptorBindingFlags, 8> bindingFlags{};
+    bindingFlags[7] = vk::DescriptorBindingFlagBits::eVariableDescriptorCount;
+    vk::DescriptorSetLayoutBindingFlagsCreateInfo bindingFlagsInfo;
+    bindingFlagsInfo.bindingCount = static_cast<uint32_t>(bindingFlags.size());
+    bindingFlagsInfo.pBindingFlags = bindingFlags.data();
+    vk::DescriptorSetLayoutCreateInfo layoutInfo({}, bindings);
+    layoutInfo.pNext = &bindingFlagsInfo;
+    rtSetLayout = device.createDescriptorSetLayout(layoutInfo);
 
     const vk::PushConstantRange cameraRange(vk::ShaderStageFlagBits::eRaygenKHR, 0, sizeof(CameraData));
     rtPipelineLayout = device.createPipelineLayout(vk::PipelineLayoutCreateInfo({}, *rtSetLayout, cameraRange));
@@ -586,7 +653,6 @@ void VulkanViewer::Impl::createFrameSync()
     for (FrameSync& frame : frames)
     {
         frame.imageAvailable = device.createSemaphore(vk::SemaphoreCreateInfo{});
-        frame.renderFinished = device.createSemaphore(vk::SemaphoreCreateInfo{});
         frame.fence = device.createFence(vk::FenceCreateInfo(vk::FenceCreateFlagBits::eSignaled));
     }
 }
@@ -644,6 +710,11 @@ void VulkanViewer::Impl::createSwapchain()
 
     swapchain = device.createSwapchainKHR(swapchainInfo);
     swapchainImages = swapchain.getImages();
+    // One present-semaphore per swapchain image avoids reusing a semaphore that
+    // is still owned by an in-flight presentation.
+    renderFinished.clear();
+    for ([[maybe_unused]] vk::Image image : swapchainImages)
+        renderFinished.push_back(device.createSemaphore(vk::SemaphoreCreateInfo{}));
     swapchainFormat = selectedFormat.format;
     swapchainViews.clear();
     swapchainViews.reserve(swapchainImages.size());
@@ -834,9 +905,11 @@ void VulkanViewer::Impl::buildScene(GltfScene loaded)
                                           vk::PipelineStageFlagBits::eRayTracingShaderKHR, {}, barrier, {}, {});
         });
 
-    next->baseColorImages.reserve(loaded.textures.size());
-    for (const GltfTexture& texture : loaded.textures)
-        next->baseColorImages.push_back(uploadTexture(texture));
+    if (loaded.textures.size() > maxBindlessTextures)
+        throw std::runtime_error("Scene requires " + std::to_string(loaded.textures.size()) +
+                                 " textures, but this device supports at most " + std::to_string(maxBindlessTextures));
+
+    next->baseColorImages = uploadTextures(loaded.textures);
     vk::SamplerCreateInfo samplerInfo;
     samplerInfo.magFilter = vk::Filter::eLinear;
     samplerInfo.minFilter = vk::Filter::eLinear;
@@ -845,16 +918,23 @@ void VulkanViewer::Impl::buildScene(GltfScene loaded)
     samplerInfo.maxLod = 0.0f;
     next->sampler = device.createSampler(samplerInfo);
 
+    const uint32_t textureCount = static_cast<uint32_t>(loaded.textures.size());
     const std::array<vk::DescriptorPoolSize, 4> poolSizes = {
         vk::DescriptorPoolSize(vk::DescriptorType::eAccelerationStructureKHR, 1),
         vk::DescriptorPoolSize(vk::DescriptorType::eStorageImage, 2),
-        vk::DescriptorPoolSize(vk::DescriptorType::eCombinedImageSampler, kMaxGltfTextures),
+        vk::DescriptorPoolSize(vk::DescriptorType::eCombinedImageSampler, textureCount),
         vk::DescriptorPoolSize(vk::DescriptorType::eStorageBuffer, 4),
     };
     next->descriptorPool = device.createDescriptorPool(
         vk::DescriptorPoolCreateInfo(vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet, 1, poolSizes));
-    next->descriptorSet = std::move(
-        device.allocateDescriptorSets(vk::DescriptorSetAllocateInfo(*next->descriptorPool, *rtSetLayout)).front());
+
+    // Bindless array: allocate exactly as many descriptors as the scene needs.
+    vk::DescriptorSetVariableDescriptorCountAllocateInfo variableCountInfo;
+    variableCountInfo.setDescriptorSetCount(1);
+    variableCountInfo.setPDescriptorCounts(&textureCount);
+    vk::DescriptorSetAllocateInfo descriptorAllocateInfo(*next->descriptorPool, *rtSetLayout);
+    descriptorAllocateInfo.pNext = &variableCountInfo;
+    next->descriptorSet = std::move(device.allocateDescriptorSets(descriptorAllocateInfo).front());
 
     vk::WriteDescriptorSetAccelerationStructureKHR asDescriptor;
     asDescriptor.setAccelerationStructures(*next->tlas);
@@ -867,15 +947,15 @@ void VulkanViewer::Impl::buildScene(GltfScene loaded)
     samplesAccumulatedInfo.imageView = *samplesAccumulated.view;
     samplesAccumulatedInfo.imageLayout = vk::ImageLayout::eGeneral;
 
-    // Fixed descriptor array: used textures first, slot 0 (white fallback) for
-    // the remaining entries. The hit shader selects one per triangle.
-    std::array<vk::DescriptorImageInfo, kMaxGltfTextures> textureInfos{};
-    for (uint32_t i = 0; i < kMaxGltfTextures; ++i)
+    std::vector<vk::DescriptorImageInfo> textureInfos;
+    textureInfos.reserve(textureCount);
+    for (const Image& image : next->baseColorImages)
     {
-        const size_t textureIndex = i < next->baseColorImages.size() ? i : 0;
-        textureInfos[i].sampler = *next->sampler;
-        textureInfos[i].imageView = *next->baseColorImages[textureIndex].view;
-        textureInfos[i].imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
+        vk::DescriptorImageInfo info{};
+        info.sampler = *next->sampler;
+        info.imageView = *image.view;
+        info.imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
+        textureInfos.push_back(info);
     }
 
     std::array<vk::WriteDescriptorSet, 8> writes{};
@@ -894,9 +974,9 @@ void VulkanViewer::Impl::buildScene(GltfScene loaded)
     writes[2]
         .setDstSet(*next->descriptorSet)
         .setDstBinding(2)
-        .setDescriptorCount(kMaxGltfTextures)
-        .setDescriptorType(vk::DescriptorType::eCombinedImageSampler)
-        .setImageInfo(textureInfos);
+        .setDescriptorCount(1)
+        .setDescriptorType(vk::DescriptorType::eStorageBuffer)
+        .setBufferInfo(materialInfo);
     writes[3]
         .setDstSet(*next->descriptorSet)
         .setDstBinding(3)
@@ -924,9 +1004,9 @@ void VulkanViewer::Impl::buildScene(GltfScene loaded)
     writes[7]
         .setDstSet(*next->descriptorSet)
         .setDstBinding(7)
-        .setDescriptorCount(1)
-        .setDescriptorType(vk::DescriptorType::eStorageBuffer)
-        .setBufferInfo(materialInfo);
+        .setDescriptorCount(textureCount)
+        .setDescriptorType(vk::DescriptorType::eCombinedImageSampler)
+        .setImageInfo(textureInfos);
     device.updateDescriptorSets(writes, {});
 
     const auto properties =
@@ -1058,7 +1138,7 @@ void VulkanViewer::Impl::drawFrame(ImDrawData* drawData)
     commandBuffer.end();
 
     const vk::Semaphore waitSemaphore = *frame.imageAvailable;
-    const vk::Semaphore signalSemaphore = *frame.renderFinished;
+    const vk::Semaphore signalSemaphore = *renderFinished[imageIndex];
     const vk::PipelineStageFlags waitStage = vk::PipelineStageFlagBits::eColorAttachmentOutput;
     const vk::CommandBuffer rawCommandBuffer = *commandBuffer;
     vk::SubmitInfo submitInfo;

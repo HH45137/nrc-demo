@@ -1,5 +1,6 @@
 #version 460
 #extension GL_EXT_ray_tracing : require
+#extension GL_EXT_nonuniform_qualifier : require
 
 // ---------------------------------------------------------------------------
 // Path tracer: closest-hit shader.
@@ -22,14 +23,14 @@ struct HitPayload
 layout(location = 0) rayPayloadInEXT HitPayload payload;
 hitAttributeEXT vec2 barycentrics;
 
-const uint kMaxTextures = 16; // must match kMaxGltfTextures on the host
-layout(set = 0, binding = 2) uniform sampler2D baseColorTextures[kMaxTextures];
+layout(set = 0, binding = 2) readonly buffer MaterialBuffer { uint materialIndices[]; };
 layout(std430, set = 0, binding = 3) readonly buffer UvBuffer { vec2 uvs[]; };
 layout(std430, set = 0, binding = 4) readonly buffer IndexBuffer { uint indices[]; };
 // Positions are tightly packed as float3, so expose them as a float array.
 layout(std430, set = 0, binding = 5) readonly buffer PositionBuffer { float positions[]; };
-// One base-color texture index per triangle.
-layout(std430, set = 0, binding = 7) readonly buffer MaterialBuffer { uint materialIndices[]; };
+// Bindless base-color array. The runtime length is set at descriptor-set
+// allocation time, so there is no compile-time texture limit.
+layout(set = 0, binding = 7) uniform sampler2D baseColorTextures[];
 
 vec3 vertexPosition(uint vertexIndex)
 {
@@ -46,8 +47,9 @@ void main()
     const vec2 uv = uvs[triangle.x] * bary.x + uvs[triangle.y] * bary.y + uvs[triangle.z] * bary.z;
 
     // The texture view is sRGB, so sampling already returns linear values.
-    const uint material = min(materialIndices[gl_PrimitiveID], kMaxTextures - 1u);
-    payload.albedo = texture(baseColorTextures[material], uv).rgb;
+    // Material indices vary per hit, so the array lookup must be non-uniform.
+    const uint material = materialIndices[gl_PrimitiveID];
+    payload.albedo = texture(baseColorTextures[nonuniformEXT(material)], uv).rgb;
 
     // Positions were already transformed into world space by the loader, so the
     // instance transform is identity and the cross product is the world normal.

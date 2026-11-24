@@ -4,10 +4,6 @@
 #include <string>
 #include <vector>
 
-// Descriptor arrays in the hit shader are fixed-size; keep this in sync with
-// shaders/hit.glsl.
-inline constexpr uint32_t kMaxGltfTextures = 16;
-
 struct GltfTexture
 {
     uint32_t width = 1;
