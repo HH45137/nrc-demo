@@ -11,8 +11,10 @@
 #include <cmath>
 #include <filesystem>
 #include <iterator>
+#include <memory>
 #include <stdexcept>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace
@@ -79,45 +81,6 @@ namespace
         return matrix;
     }
 
-    void collectMeshTransforms(const cgltf_node& node, const cgltf_data& data, const Mat4& parent,
-                               std::vector<Mat4>& transforms, std::vector<bool>& assigned)
-    {
-        const Mat4 world = multiply(parent, nodeLocalTransform(node));
-        if (node.mesh)
-        {
-            const size_t meshIndex = static_cast<size_t>(node.mesh - data.meshes);
-            if (meshIndex < transforms.size() && !assigned[meshIndex])
-            {
-                transforms[meshIndex] = world;
-                assigned[meshIndex] = true;
-            }
-        }
-        for (size_t i = 0; i < node.children_count; ++i)
-            collectMeshTransforms(*node.children[i], data, world, transforms, assigned);
-    }
-
-    std::vector<Mat4> collectSceneMeshTransforms(const cgltf_data& data)
-    {
-        std::vector<Mat4> transforms(data.meshes_count, identityMatrix());
-        std::vector<bool> assigned(data.meshes_count, false);
-
-        if (data.scene)
-        {
-            for (size_t i = 0; i < data.scene->nodes_count; ++i)
-                collectMeshTransforms(*data.scene->nodes[i], data, identityMatrix(), transforms, assigned);
-        }
-        else
-        {
-            // No explicit scene: treat nodes without a parent as roots.
-            for (size_t i = 0; i < data.nodes_count; ++i)
-            {
-                if (!data.nodes[i].parent)
-                    collectMeshTransforms(data.nodes[i], data, identityMatrix(), transforms, assigned);
-            }
-        }
-        return transforms;
-    }
-
     void transformPosition(const Mat4& matrix, float* position)
     {
         const float x = position[0];
@@ -135,121 +98,198 @@ namespace
             position[2] /= w;
         }
     }
+
+    bool loadTexture(const cgltf_image& image, const std::string& scenePath, GltfTexture& texture)
+    {
+        int width = 0;
+        int height = 0;
+        int channels = 0;
+        stbi_uc* pixels = nullptr;
+
+        if (image.buffer_view)
+        {
+            const uint8_t* bytes = cgltf_buffer_view_data(image.buffer_view);
+            if (bytes && image.buffer_view->size <= static_cast<size_t>(INT_MAX))
+            {
+                pixels = stbi_load_from_memory(bytes, static_cast<int>(image.buffer_view->size), &width, &height,
+                                               &channels, STBI_rgb_alpha);
+            }
+        }
+        else if (image.uri && std::string_view(image.uri).substr(0, 5) != "data:")
+        {
+            const std::filesystem::path texturePath = std::filesystem::path(scenePath).parent_path() / image.uri;
+            pixels = stbi_load(texturePath.string().c_str(), &width, &height, &channels, STBI_rgb_alpha);
+        }
+
+        if (!pixels)
+            return false;
+
+        texture.width = static_cast<uint32_t>(width);
+        texture.height = static_cast<uint32_t>(height);
+        texture.rgba.assign(pixels, pixels + static_cast<size_t>(width) * height * 4);
+        stbi_image_free(pixels);
+        return true;
+    }
+
+    uint32_t resolveMaterialTexture(const cgltf_primitive& primitive, const std::string& scenePath, GltfScene& scene,
+                                    std::unordered_map<const cgltf_image*, uint32_t>& textureIndices)
+    {
+        const cgltf_material* material = primitive.material;
+        if (!material || !material->has_pbr_metallic_roughness)
+            return 0;
+
+        const cgltf_texture* texture = material->pbr_metallic_roughness.base_color_texture.texture;
+        const cgltf_image* image = texture ? texture->image : nullptr;
+        if (!image)
+            return 0;
+
+        const auto existing = textureIndices.find(image);
+        if (existing != textureIndices.end())
+            return existing->second;
+
+        if (scene.textures.size() >= kMaxGltfTextures)
+            return 0;
+
+        GltfTexture loaded;
+        if (!loadTexture(*image, scenePath, loaded))
+            return 0;
+
+        const uint32_t index = static_cast<uint32_t>(scene.textures.size());
+        scene.textures.push_back(std::move(loaded));
+        textureIndices.emplace(image, index);
+        return index;
+    }
+
+    void appendPrimitive(const cgltf_primitive& primitive, const Mat4& world, const std::string& scenePath,
+                         GltfScene& scene, std::unordered_map<const cgltf_image*, uint32_t>& textureIndices)
+    {
+        if (primitive.type != cgltf_primitive_type_triangles)
+            return;
+
+        const cgltf_accessor* positions = nullptr;
+        const cgltf_accessor* texcoords = nullptr;
+        for (size_t attributeIndex = 0; attributeIndex < primitive.attributes_count; ++attributeIndex)
+        {
+            const cgltf_attribute& attribute = primitive.attributes[attributeIndex];
+            if (attribute.type == cgltf_attribute_type_position)
+                positions = attribute.data;
+            else if (attribute.type == cgltf_attribute_type_texcoord && attribute.index == 0)
+                texcoords = attribute.data;
+        }
+        if (!positions || positions->count == 0)
+            return;
+
+        const size_t inputIndexCount = primitive.indices ? primitive.indices->count : positions->count;
+        if (inputIndexCount % 3 != 0)
+            return;
+
+        const size_t vertexBase = scene.positions.size() / 3;
+        const size_t indexBase = scene.indices.size();
+
+        scene.positions.resize((vertexBase + positions->count) * 3);
+        scene.texcoords.resize((vertexBase + positions->count) * 2, 0.0f);
+        for (size_t i = 0; i < positions->count; ++i)
+        {
+            float* position = &scene.positions[(vertexBase + i) * 3];
+            if (!cgltf_accessor_read_float(positions, i, position, 3))
+                throw std::runtime_error("Cannot read POSITION accessor");
+            transformPosition(world, position);
+        }
+
+        if (texcoords)
+        {
+            const size_t count = std::min<size_t>(texcoords->count, positions->count);
+            for (size_t i = 0; i < count; ++i)
+            {
+                if (!cgltf_accessor_read_float(texcoords, i, &scene.texcoords[(vertexBase + i) * 2], 2))
+                    throw std::runtime_error("Cannot read TEXCOORD_0 accessor");
+            }
+        }
+
+        scene.indices.resize(indexBase + inputIndexCount);
+        if (primitive.indices)
+        {
+            for (size_t i = 0; i < inputIndexCount; ++i)
+            {
+                scene.indices[indexBase + i] =
+                    static_cast<uint32_t>(vertexBase + cgltf_accessor_read_index(primitive.indices, i));
+            }
+        }
+        else
+        {
+            for (size_t i = 0; i < inputIndexCount; ++i)
+                scene.indices[indexBase + i] = static_cast<uint32_t>(vertexBase + i);
+        }
+
+        const uint32_t texture = resolveMaterialTexture(primitive, scenePath, scene, textureIndices);
+        scene.materialIndices.insert(scene.materialIndices.end(), inputIndexCount / 3, texture);
+    }
+
+    void appendNode(const cgltf_node& node, const std::string& scenePath, const Mat4& parent, GltfScene& scene,
+                    std::unordered_map<const cgltf_image*, uint32_t>& textureIndices)
+    {
+        const Mat4 world = multiply(parent, nodeLocalTransform(node));
+        if (node.mesh)
+        {
+            for (size_t primitiveIndex = 0; primitiveIndex < node.mesh->primitives_count; ++primitiveIndex)
+                appendPrimitive(node.mesh->primitives[primitiveIndex], world, scenePath, scene, textureIndices);
+        }
+        for (size_t childIndex = 0; childIndex < node.children_count; ++childIndex)
+            appendNode(*node.children[childIndex], scenePath, world, scene, textureIndices);
+    }
 } // namespace
 
 GltfScene loadGltfScene(const std::string& path)
 {
     cgltf_options options{};
-    cgltf_data* data = nullptr;
-    if (cgltf_parse_file(&options, path.c_str(), &data) != cgltf_result_success)
-        throw std::runtime_error("Cannot parse glTF scene: " + path);
-
-    if (cgltf_load_buffers(&options, data, path.c_str()) != cgltf_result_success)
+    cgltf_data* rawData = nullptr;
+    if (cgltf_parse_file(&options, path.c_str(), &rawData) != cgltf_result_success)
     {
-        cgltf_free(data);
-        throw std::runtime_error("Cannot load glTF buffers");
+        if (rawData)
+            cgltf_free(rawData);
+        throw std::runtime_error("Cannot parse glTF scene: " + path);
     }
+    const std::unique_ptr<cgltf_data, decltype(&cgltf_free)> data(rawData, cgltf_free);
+
+    if (cgltf_load_buffers(&options, data.get(), path.c_str()) != cgltf_result_success)
+        throw std::runtime_error("Cannot load glTF buffers");
 
     GltfScene scene;
-    // glTF stores mesh vertices in object space. Apply the world transform of the
-    // first node that references each mesh so node rotations/scales are honored.
-    const std::vector<Mat4> meshTransforms = collectSceneMeshTransforms(*data);
-    for (size_t meshIndex = 0; meshIndex < data->meshes_count && scene.positions.empty(); ++meshIndex)
+    // Slot 0 is the white fallback used by untextured materials.
+    scene.textures.emplace_back();
+    std::unordered_map<const cgltf_image*, uint32_t> textureIndices;
+
+    if (data->scene)
     {
-        const cgltf_mesh& mesh = data->meshes[meshIndex];
-        const Mat4& meshTransform = meshTransforms[meshIndex];
-        for (size_t primitiveIndex = 0; primitiveIndex < mesh.primitives_count && scene.positions.empty();
-             ++primitiveIndex)
+        for (size_t nodeIndex = 0; nodeIndex < data->scene->nodes_count; ++nodeIndex)
+            appendNode(*data->scene->nodes[nodeIndex], path, identityMatrix(), scene, textureIndices);
+    }
+    else
+    {
+        for (size_t nodeIndex = 0; nodeIndex < data->nodes_count; ++nodeIndex)
         {
-            const cgltf_primitive& primitive = mesh.primitives[primitiveIndex];
-            if (primitive.type != cgltf_primitive_type_triangles)
-                continue;
+            if (!data->nodes[nodeIndex].parent)
+                appendNode(data->nodes[nodeIndex], path, identityMatrix(), scene, textureIndices);
+        }
+    }
 
-            const cgltf_accessor* positions = nullptr;
-            const cgltf_accessor* texcoords = nullptr;
-            for (size_t attributeIndex = 0; attributeIndex < primitive.attributes_count; ++attributeIndex)
+    // Some files contain meshes but no nodes/scene. Append them once in object space.
+    if (scene.positions.empty())
+    {
+        for (size_t meshIndex = 0; meshIndex < data->meshes_count; ++meshIndex)
+        {
+            const cgltf_mesh& mesh = data->meshes[meshIndex];
+            for (size_t primitiveIndex = 0; primitiveIndex < mesh.primitives_count; ++primitiveIndex)
             {
-                const cgltf_attribute& attribute = primitive.attributes[attributeIndex];
-                if (attribute.type == cgltf_attribute_type_position)
-                    positions = attribute.data;
-                else if (attribute.type == cgltf_attribute_type_texcoord && attribute.index == 0)
-                    texcoords = attribute.data;
-            }
-            if (!positions)
-                continue;
-
-            scene.positions.resize(positions->count * 3);
-            scene.texcoords.assign(positions->count * 2, 0.0f);
-            for (size_t i = 0; i < positions->count; ++i)
-            {
-                if (!cgltf_accessor_read_float(positions, i, &scene.positions[i * 3], 3))
-                    throw std::runtime_error("Cannot read POSITION accessor");
-                transformPosition(meshTransform, &scene.positions[i * 3]);
-            }
-            if (texcoords)
-            {
-                const size_t count = std::min<size_t>(texcoords->count, positions->count);
-                for (size_t i = 0; i < count; ++i)
-                {
-                    if (!cgltf_accessor_read_float(texcoords, i, &scene.texcoords[i * 2], 2))
-                        throw std::runtime_error("Cannot read TEXCOORD_0 accessor");
-                }
-            }
-
-            if (primitive.indices)
-            {
-                scene.indices.resize(primitive.indices->count);
-                for (size_t i = 0; i < primitive.indices->count; ++i)
-                    scene.indices[i] = static_cast<uint32_t>(cgltf_accessor_read_index(primitive.indices, i));
-            }
-            else
-            {
-                scene.indices.resize(positions->count);
-                for (uint32_t i = 0; i < scene.indices.size(); ++i)
-                    scene.indices[i] = i;
-            }
-
-            if (primitive.material && primitive.material->has_pbr_metallic_roughness)
-            {
-                const cgltf_texture* texture = primitive.material->pbr_metallic_roughness.base_color_texture.texture;
-                const cgltf_image* image = texture ? texture->image : nullptr;
-                if (image)
-                {
-                    int width = 0, height = 0, channels = 0;
-                    stbi_uc* pixels = nullptr;
-                    if (image->buffer_view)
-                    {
-                        const uint8_t* bytes = cgltf_buffer_view_data(image->buffer_view);
-                        if (bytes && image->buffer_view->size <= static_cast<size_t>(INT_MAX))
-                        {
-                            pixels = stbi_load_from_memory(bytes, static_cast<int>(image->buffer_view->size), &width,
-                                                           &height, &channels, STBI_rgb_alpha);
-                        }
-                    }
-                    else if (image->uri && std::string_view(image->uri).substr(0, 5) != "data:")
-                    {
-                        const std::filesystem::path texturePath =
-                            std::filesystem::path(path).parent_path() / image->uri;
-                        pixels = stbi_load(texturePath.string().c_str(), &width, &height, &channels, STBI_rgb_alpha);
-                    }
-
-                    if (pixels)
-                    {
-                        const size_t byteCount = static_cast<size_t>(width) * height * 4;
-                        scene.baseColorRgba.assign(pixels, pixels + byteCount);
-                        scene.textureWidth = static_cast<uint32_t>(width);
-                        scene.textureHeight = static_cast<uint32_t>(height);
-                        scene.hasBaseColorTexture = true;
-                        stbi_image_free(pixels);
-                    }
-                }
+                appendPrimitive(mesh.primitives[primitiveIndex], identityMatrix(), path, scene, textureIndices);
             }
         }
     }
-    cgltf_free(data);
 
     if (scene.positions.empty() || scene.indices.empty() || scene.indices.size() % 3 != 0)
-        throw std::runtime_error("Scene contains no supported triangle primitive");
+        throw std::runtime_error("Scene contains no supported triangle primitives");
+    if (scene.materialIndices.size() * 3 != scene.indices.size())
+        throw std::runtime_error("Scene material table does not match triangle count");
 
     std::array<float, 3> min = {scene.positions[0], scene.positions[1], scene.positions[2]};
     std::array<float, 3> max = min;

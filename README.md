@@ -1,6 +1,6 @@
 # Vulkan glTF ray-tracing viewer
 
-A GLFW `NO_API` window viewer using Vulkan 1.2, Vulkan-Hpp RAII, and Dear ImGui's Vulkan backend. Scene tracing, swapchain composition, and presentation are all Vulkan; the project has no OpenGL dependency or OpenGL context. The render viewport fills the whole window, with a small floating control panel. The first triangle primitive from a glTF 2.0 / GLB scene is uploaded (including the node transform that references it), BLAS/TLAS are built, and the path-traced output image is sampled directly by ImGui on the swapchain.
+A GLFW `NO_API` window viewer using Vulkan 1.2, Vulkan-Hpp RAII, and Dear ImGui's Vulkan backend. Scene tracing, swapchain composition, and presentation are all Vulkan; the project has no OpenGL dependency or OpenGL context. The render viewport fills the whole window, with a small floating control panel. All triangle primitives from the glTF scene graph are merged into one scene (with node world transforms), BLAS/TLAS are built, and the path-traced output image is sampled directly by ImGui on the swapchain.
 
 The renderer is a progressive Monte Carlo path tracer. Each frame adds one cosine-weighted sample per pixel (up to 4 diffuse bounces, Russian roulette, procedural sky and sun) into a floating-point accumulation image. Camera changes restart accumulation; leaving the camera idle converges the image over time. Bounces are launched iteratively from ray generation, so the ray-tracing pipeline stays at recursion depth 1.
 
@@ -32,8 +32,8 @@ Camera controls:
 ## Scope
 
 - Loads `.gltf` with external buffers and `.glb` through cgltf.
-- Currently renders only the first triangle primitive. The world transform of the first node that references the mesh is applied; skinning, morph targets and animations are not handled, and material factors are ignored.
-- Loads `TEXCOORD_0` and samples the primitive material's base-color texture (embedded GLB bufferView or external image URI); other PBR maps and texture transforms are not handled.
+- Renders all triangle primitives reachable from the glTF scene graph, applying each node's world transform. Instanced mesh nodes are duplicated into the merged geometry. Skinning, morph targets and animations are not handled, and material factors are ignored.
+- Samples a per-triangle base-color texture from a 16-slot descriptor array (embedded GLB bufferView or external image URI). More than 16 distinct textures fall back to white, and other PBR maps / texture transforms are not handled.
 - Path-tracing shaders live in `shaders/raygen.glsl`, `shaders/miss.glsl`, and `shaders/hit.glsl`; CMake compiles them to SPIR-V and the RT pipeline uses recursion depth 1.
 - Renders into a Vulkan storage/sampled image, then displays that image through the Dear ImGui Vulkan backend in the Vulkan swapchain.
 - Uses Vulkan-Hpp RAII handles and generated dispatch; application code does not load Vulkan function pointers manually.

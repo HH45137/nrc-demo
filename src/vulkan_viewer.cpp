@@ -156,9 +156,9 @@ struct VulkanViewer::Impl
 
     struct Scene
     {
-        Buffer vertices, texcoords, indices, instance, blasStorage, tlasStorage, sbt;
+        Buffer vertices, texcoords, indices, materialIndices, instance, blasStorage, tlasStorage, sbt;
         vk::raii::AccelerationStructureKHR blas{nullptr}, tlas{nullptr};
-        Image baseColor;
+        std::vector<Image> baseColorImages;
         vk::raii::Sampler sampler{nullptr};
         vk::raii::DescriptorPool descriptorPool{nullptr};
         vk::raii::DescriptorSet descriptorSet{nullptr};
@@ -303,6 +303,46 @@ struct VulkanViewer::Impl
         queue.waitIdle();
     }
 
+    Image uploadTexture(const GltfTexture& texture)
+    {
+        Image result = createImage(texture.width, texture.height, vk::Format::eR8G8B8A8Srgb,
+                                   vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled);
+        Buffer staging = createBuffer(
+            texture.rgba.size(), vk::BufferUsageFlagBits::eTransferSrc,
+            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent, texture.rgba.data());
+        immediateSubmit(
+            [&](vk::raii::CommandBuffer& commandBuffer)
+            {
+                vk::ImageMemoryBarrier toTransfer;
+                toTransfer.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+                toTransfer.oldLayout = vk::ImageLayout::eUndefined;
+                toTransfer.newLayout = vk::ImageLayout::eTransferDstOptimal;
+                toTransfer.srcQueueFamilyIndex = toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                toTransfer.image = *result.handle;
+                toTransfer.subresourceRange = vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1);
+                commandBuffer.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,
+                                              vk::PipelineStageFlagBits::eTransfer, {}, {}, {}, toTransfer);
+
+                vk::BufferImageCopy copy;
+                copy.imageSubresource = vk::ImageSubresourceLayers(vk::ImageAspectFlagBits::eColor, 0, 0, 1);
+                copy.imageExtent = vk::Extent3D(texture.width, texture.height, 1);
+                commandBuffer.copyBufferToImage(*staging.handle, *result.handle, vk::ImageLayout::eTransferDstOptimal,
+                                                copy);
+
+                vk::ImageMemoryBarrier toShader;
+                toShader.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+                toShader.dstAccessMask = vk::AccessFlagBits::eShaderRead;
+                toShader.oldLayout = vk::ImageLayout::eTransferDstOptimal;
+                toShader.newLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
+                toShader.srcQueueFamilyIndex = toShader.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                toShader.image = *result.handle;
+                toShader.subresourceRange = vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1);
+                commandBuffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                                              vk::PipelineStageFlagBits::eRayTracingShaderKHR, {}, {}, {}, toShader);
+            });
+        return result;
+    }
+
     void createInstanceAndDevice();
     void createCommandPool();
     void createAllImages();
@@ -383,6 +423,10 @@ void VulkanViewer::Impl::createInstanceAndDevice()
         !supportedFeatures.get<vk::PhysicalDeviceRayTracingPipelineFeaturesKHR>().rayTracingPipeline)
         throw std::runtime_error("The selected device does not support required Vulkan RT features");
 
+    const vk::PhysicalDeviceFeatures coreFeatures = physicalDevice.getFeatures();
+    if (!coreFeatures.shaderSampledImageArrayDynamicIndexing)
+        throw std::runtime_error("The selected device cannot dynamically index sampled-image arrays");
+
     vk::PhysicalDeviceRayTracingPipelineFeaturesKHR rayTracingFeatures;
     vk::PhysicalDeviceAccelerationStructureFeaturesKHR accelerationFeatures;
     vk::PhysicalDeviceBufferDeviceAddressFeatures addressFeatures;
@@ -391,10 +435,15 @@ void VulkanViewer::Impl::createInstanceAndDevice()
     addressFeatures.bufferDeviceAddress = true;
     accelerationFeatures.accelerationStructure = true;
     rayTracingFeatures.rayTracingPipeline = true;
+
+    // Materials are selected per hit through a fixed descriptor array.
+    vk::PhysicalDeviceFeatures2 coreFeatureChain;
+    coreFeatureChain.features.shaderSampledImageArrayDynamicIndexing = VK_TRUE;
+    coreFeatureChain.pNext = &addressFeatures;
     const float priority = 1.0f;
     vk::DeviceQueueCreateInfo queueInfo({}, queueFamily, 1, &priority);
     vk::DeviceCreateInfo deviceInfo;
-    deviceInfo.pNext = &addressFeatures;
+    deviceInfo.pNext = &coreFeatureChain;
     deviceInfo.setQueueCreateInfos(queueInfo);
     deviceInfo.setPEnabledExtensionNames(kDeviceExtensions);
     device = physicalDevice.createDevice(deviceInfo);
@@ -445,11 +494,11 @@ void VulkanViewer::Impl::createAllImages()
 
 void VulkanViewer::Impl::createRtPipeline()
 {
-    const std::array<vk::DescriptorSetLayoutBinding, 7> bindings = {
+    const std::array<vk::DescriptorSetLayoutBinding, 8> bindings = {
         vk::DescriptorSetLayoutBinding(0, vk::DescriptorType::eAccelerationStructureKHR, 1,
                                        vk::ShaderStageFlagBits::eRaygenKHR),
         vk::DescriptorSetLayoutBinding(1, vk::DescriptorType::eStorageImage, 1, vk::ShaderStageFlagBits::eRaygenKHR),
-        vk::DescriptorSetLayoutBinding(2, vk::DescriptorType::eCombinedImageSampler, 1,
+        vk::DescriptorSetLayoutBinding(2, vk::DescriptorType::eCombinedImageSampler, kMaxGltfTextures,
                                        vk::ShaderStageFlagBits::eClosestHitKHR),
         vk::DescriptorSetLayoutBinding(3, vk::DescriptorType::eStorageBuffer, 1,
                                        vk::ShaderStageFlagBits::eClosestHitKHR),
@@ -458,6 +507,8 @@ void VulkanViewer::Impl::createRtPipeline()
         vk::DescriptorSetLayoutBinding(5, vk::DescriptorType::eStorageBuffer, 1,
                                        vk::ShaderStageFlagBits::eClosestHitKHR),
         vk::DescriptorSetLayoutBinding(6, vk::DescriptorType::eStorageImage, 1, vk::ShaderStageFlagBits::eRaygenKHR),
+        vk::DescriptorSetLayoutBinding(7, vk::DescriptorType::eStorageBuffer, 1,
+                                       vk::ShaderStageFlagBits::eClosestHitKHR),
     };
     rtSetLayout = device.createDescriptorSetLayout(vk::DescriptorSetLayoutCreateInfo({}, bindings));
 
@@ -662,6 +713,11 @@ void VulkanViewer::Impl::recreateSwapchain()
 
 void VulkanViewer::Impl::buildScene(GltfScene loaded)
 {
+    if (loaded.textures.empty())
+        loaded.textures.emplace_back();
+    if (loaded.materialIndices.size() * 3 != loaded.indices.size())
+        throw std::runtime_error("Scene material table does not match triangle count");
+
     auto next = std::make_unique<Scene>();
     const auto hostVisible = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent;
     const auto buildInput = vk::BufferUsageFlagBits::eShaderDeviceAddress |
@@ -673,6 +729,9 @@ void VulkanViewer::Impl::buildScene(GltfScene loaded)
     next->indices =
         createBuffer(loaded.indices.size() * sizeof(uint32_t), buildInput | vk::BufferUsageFlagBits::eIndexBuffer,
                      hostVisible, loaded.indices.data());
+    next->materialIndices =
+        createBuffer(loaded.materialIndices.size() * sizeof(uint32_t), vk::BufferUsageFlagBits::eStorageBuffer,
+                     hostVisible, loaded.materialIndices.data());
 
     vk::BufferUsageFlags scratchUsage =
         vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress;
@@ -774,38 +833,9 @@ void VulkanViewer::Impl::buildScene(GltfScene loaded)
                                           vk::PipelineStageFlagBits::eRayTracingShaderKHR, {}, barrier, {}, {});
         });
 
-    next->baseColor = createImage(loaded.textureWidth, loaded.textureHeight, vk::Format::eR8G8B8A8Srgb,
-                                  vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled);
-    Buffer textureStaging = createBuffer(loaded.baseColorRgba.size(), vk::BufferUsageFlagBits::eTransferSrc,
-                                         hostVisible, loaded.baseColorRgba.data());
-    immediateSubmit(
-        [&](vk::raii::CommandBuffer& commandBuffer)
-        {
-            vk::ImageMemoryBarrier toTransfer;
-            toTransfer.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
-            toTransfer.oldLayout = vk::ImageLayout::eUndefined;
-            toTransfer.newLayout = vk::ImageLayout::eTransferDstOptimal;
-            toTransfer.srcQueueFamilyIndex = toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            toTransfer.image = *next->baseColor.handle;
-            toTransfer.subresourceRange = vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1);
-            commandBuffer.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe, vk::PipelineStageFlagBits::eTransfer,
-                                          {}, {}, {}, toTransfer);
-            vk::BufferImageCopy copy;
-            copy.imageSubresource = vk::ImageSubresourceLayers(vk::ImageAspectFlagBits::eColor, 0, 0, 1);
-            copy.imageExtent = vk::Extent3D(loaded.textureWidth, loaded.textureHeight, 1);
-            commandBuffer.copyBufferToImage(*textureStaging.handle, *next->baseColor.handle,
-                                            vk::ImageLayout::eTransferDstOptimal, copy);
-            vk::ImageMemoryBarrier toShader;
-            toShader.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
-            toShader.dstAccessMask = vk::AccessFlagBits::eShaderRead;
-            toShader.oldLayout = vk::ImageLayout::eTransferDstOptimal;
-            toShader.newLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
-            toShader.srcQueueFamilyIndex = toShader.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            toShader.image = *next->baseColor.handle;
-            toShader.subresourceRange = vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1);
-            commandBuffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-                                          vk::PipelineStageFlagBits::eRayTracingShaderKHR, {}, {}, {}, toShader);
-        });
+    next->baseColorImages.reserve(loaded.textures.size());
+    for (const GltfTexture& texture : loaded.textures)
+        next->baseColorImages.push_back(uploadTexture(texture));
     vk::SamplerCreateInfo samplerInfo;
     samplerInfo.magFilter = vk::Filter::eLinear;
     samplerInfo.minFilter = vk::Filter::eLinear;
@@ -817,8 +847,8 @@ void VulkanViewer::Impl::buildScene(GltfScene loaded)
     const std::array<vk::DescriptorPoolSize, 4> poolSizes = {
         vk::DescriptorPoolSize(vk::DescriptorType::eAccelerationStructureKHR, 1),
         vk::DescriptorPoolSize(vk::DescriptorType::eStorageImage, 2),
-        vk::DescriptorPoolSize(vk::DescriptorType::eCombinedImageSampler, 1),
-        vk::DescriptorPoolSize(vk::DescriptorType::eStorageBuffer, 3),
+        vk::DescriptorPoolSize(vk::DescriptorType::eCombinedImageSampler, kMaxGltfTextures),
+        vk::DescriptorPoolSize(vk::DescriptorType::eStorageBuffer, 4),
     };
     next->descriptorPool = device.createDescriptorPool(
         vk::DescriptorPoolCreateInfo(vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet, 1, poolSizes));
@@ -828,15 +858,26 @@ void VulkanViewer::Impl::buildScene(GltfScene loaded)
     vk::WriteDescriptorSetAccelerationStructureKHR asDescriptor;
     asDescriptor.setAccelerationStructures(*next->tlas);
     const vk::DescriptorImageInfo outputInfo(*outputSampler, *output.view, vk::ImageLayout::eGeneral);
-    const vk::DescriptorImageInfo textureInfo(*next->sampler, *next->baseColor.view,
-                                              vk::ImageLayout::eShaderReadOnlyOptimal);
     const vk::DescriptorBufferInfo uvInfo(*next->texcoords.handle, 0, VK_WHOLE_SIZE);
     const vk::DescriptorBufferInfo indexInfo(*next->indices.handle, 0, VK_WHOLE_SIZE);
     const vk::DescriptorBufferInfo positionInfo(*next->vertices.handle, 0, VK_WHOLE_SIZE);
+    const vk::DescriptorBufferInfo materialInfo(*next->materialIndices.handle, 0, VK_WHOLE_SIZE);
     vk::DescriptorImageInfo samplesAccumulatedInfo{};
     samplesAccumulatedInfo.imageView = *samplesAccumulated.view;
     samplesAccumulatedInfo.imageLayout = vk::ImageLayout::eGeneral;
-    std::array<vk::WriteDescriptorSet, 7> writes{};
+
+    // Fixed descriptor array: used textures first, slot 0 (white fallback) for
+    // the remaining entries. The hit shader selects one per triangle.
+    std::array<vk::DescriptorImageInfo, kMaxGltfTextures> textureInfos{};
+    for (uint32_t i = 0; i < kMaxGltfTextures; ++i)
+    {
+        const size_t textureIndex = i < next->baseColorImages.size() ? i : 0;
+        textureInfos[i].sampler = *next->sampler;
+        textureInfos[i].imageView = *next->baseColorImages[textureIndex].view;
+        textureInfos[i].imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
+    }
+
+    std::array<vk::WriteDescriptorSet, 8> writes{};
     writes[0]
         .setPNext(&asDescriptor)
         .setDstSet(*next->descriptorSet)
@@ -852,9 +893,9 @@ void VulkanViewer::Impl::buildScene(GltfScene loaded)
     writes[2]
         .setDstSet(*next->descriptorSet)
         .setDstBinding(2)
-        .setDescriptorCount(1)
+        .setDescriptorCount(kMaxGltfTextures)
         .setDescriptorType(vk::DescriptorType::eCombinedImageSampler)
-        .setImageInfo(textureInfo);
+        .setImageInfo(textureInfos);
     writes[3]
         .setDstSet(*next->descriptorSet)
         .setDstBinding(3)
@@ -879,6 +920,12 @@ void VulkanViewer::Impl::buildScene(GltfScene loaded)
         .setDescriptorCount(1)
         .setDescriptorType(vk::DescriptorType::eStorageImage)
         .setImageInfo(samplesAccumulatedInfo);
+    writes[7]
+        .setDstSet(*next->descriptorSet)
+        .setDstBinding(7)
+        .setDescriptorCount(1)
+        .setDescriptorType(vk::DescriptorType::eStorageBuffer)
+        .setBufferInfo(materialInfo);
     device.updateDescriptorSets(writes, {});
 
     const auto properties =
@@ -921,8 +968,10 @@ void VulkanViewer::Impl::buildScene(GltfScene loaded)
     camera.yaw = 3.14159265f;
     camera.position = {0.0f, 0.0f, -camera.distance};
     sampleIndex = 1;
+    const size_t baseColorTextureCount = loaded.textures.size() - 1;
     status = "Loaded " + std::to_string(scene->triangleCount) + " triangles | " +
-        (loaded.hasBaseColorTexture ? "baseColor texture loaded" : "white fallback texture");
+        std::to_string(baseColorTextureCount) +
+        (baseColorTextureCount == 1 ? " base-color texture" : " base-color textures");
 }
 
 void VulkanViewer::Impl::recordTrace(vk::raii::CommandBuffer& commandBuffer)
